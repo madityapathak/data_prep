@@ -1,24 +1,26 @@
 from datasets import load_dataset
-from utils import TARGETS, en_filter, dfs
-
-
-
-oasst_dataset                   = load_dataset("OpenAssistant/oasst1")
-training_messages               = oasst_dataset["train"]
-validation_messages             = oasst_dataset["validation"]
-english_training_messages       = training_messages.filter(en_filter)
-english_validation_messages     = validation_messages.filter(en_filter)
-
+from utils import en_filter, dfs
 
 
 class OASSTProcessor:
+    USER_TOKEN = "<|USER|>"
+    ASSISTANT_TOKEN = "<|ASSISTANT|>"
+    EOS_TOKEN = "<|EOS|>"
+    BOS_TOKEN = "<|BOS|>"
+    EOT_TOKEN = "<|EOT|>"
+
+    def __init__(self):
+        dataset = load_dataset("OpenAssistant/oasst1")
+
+        self.train_dataset = dataset["train"].filter(en_filter)
+        self.validation_dataset = dataset["validation"].filter(en_filter)
 
     @staticmethod
     def build_conversations(messages):
-        parent_to_children      = {}
-        message_lookup          = {}
-        root_message_ids        = []
-        conversations           = []
+        parent_to_children = {}
+        message_lookup = {}
+        root_message_ids = []
+        conversations = []
 
         for message in messages:
             message_id = message["message_id"]
@@ -27,10 +29,11 @@ class OASSTProcessor:
             if parent_message_id is None:
                 root_message_ids.append(message_id)
             else:
-                parent_to_children.setdefault(parent_message_id, []).append(message_id)
+                parent_to_children.setdefault(
+                    parent_message_id, []
+                ).append(message_id)
 
-        for message in messages:
-            message_lookup[message["message_id"]] = {
+            message_lookup[message_id] = {
                 "message": message["text"],
                 "role": message["role"],
             }
@@ -48,13 +51,6 @@ class OASSTProcessor:
 
     @staticmethod
     def validate_conversations(conversations, message_lookup):
-        """
-        Checks that every conversation:
-        1. Has an even number of messages.
-        2. Starts with a prompter.
-        3. Alternates prompter -> assistant -> prompter -> assistant.
-        """
-
         valid = True
 
         for conversation_index, conversation in enumerate(conversations):
@@ -91,24 +87,27 @@ class OASSTProcessor:
 
     @staticmethod
     def format_conversations(conversations, message_lookup):
-        formatted_data = []
+        formatted_conversations = []
 
         for conversation in conversations:
-            messages = []
+            formatted_messages = []
 
             for message_id in conversation:
                 message = message_lookup[message_id]["message"].strip()
                 role = message_lookup[message_id]["role"]
 
                 if role == "prompter":
-                    messages.append(f"<|USER|>{message}<|EOS|>")
+                    formatted_messages.append(
+                        f"{OASSTProcessor.USER_TOKEN}{message}{OASSTProcessor.EOS_TOKEN}"
+                    )
+                else:
+                    formatted_messages.append(
+                        f"{OASSTProcessor.ASSISTANT_TOKEN}{message}{OASSTProcessor.EOS_TOKEN}"
+                    )
 
-                elif role == "assistant":
-                    messages.append(f"<|ASSISTANT|>{message}<|EOS|>")
+            formatted_conversations.append(formatted_messages)
 
-            formatted_data.append(messages)
-
-        return formatted_data
+        return formatted_conversations
 
     @staticmethod
     def add_special_tokens(conversations):
@@ -116,13 +115,12 @@ class OASSTProcessor:
 
         for conversation in conversations:
             tokenized_conversations.append(
-                ["<|BOS|>"] +
-                conversation +
-                ["<|EOT|>"]
+                [OASSTProcessor.BOS_TOKEN]
+                + conversation
+                + [OASSTProcessor.EOT_TOKEN]
             )
 
         return tokenized_conversations
-    
 
     @staticmethod
     def merge_conversation_tokens(conversations):
@@ -133,48 +131,46 @@ class OASSTProcessor:
 
         return merged_conversations
 
+    def build_dataset(self, dataset):
+        conversations, message_lookup = self.build_conversations(dataset)
+
+        self.validate_conversations(
+            conversations,
+            message_lookup,
+        )
+
+        formatted_conversations = self.format_conversations(
+            conversations,
+            message_lookup,
+        )
+
+        formatted_conversations = self.add_special_tokens(
+            formatted_conversations
+        )
+
+        formatted_conversations = self.merge_conversation_tokens(
+            formatted_conversations
+        )
+
+        return formatted_conversations
+
+    def get_train_data(self):
+        return self.build_dataset(self.train_dataset)
+
+    def get_validation_data(self):
+        return self.build_dataset(self.validation_dataset)
 
 
 
-training_conversations, training_message_lookup = (
-    OASSTProcessor.build_conversations(
-        english_training_messages
-    )
-)
 
-validation_conversations, validation_message_lookup = (
-    OASSTProcessor.build_conversations(
-        english_validation_messages
-    )
-)
+processor = OASSTProcessor()
 
-OASSTProcessor.validate_conversations(
-    training_conversations,
-    training_message_lookup,
-)
+oasst_train_data = processor.get_train_data()
+oasst_validation_data = processor.get_validation_data()
 
-OASSTProcessor.validate_conversations(
-    validation_conversations,
-    validation_message_lookup,
-)
+print(oasst_train_data[:2])
+print(len(oasst_train_data))
 
-oasst_train_data = OASSTProcessor.format_conversations(
-    training_conversations,
-    training_message_lookup,
-)
-
-oasst_val_data = OASSTProcessor.format_conversations(
-    validation_conversations,
-    validation_message_lookup,
-)
-
-oasst_train_data = OASSTProcessor.add_special_tokens(oasst_train_data)
-oasst_val_data = OASSTProcessor.add_special_tokens(oasst_val_data)
-
-
-oasst_train_data = OASSTProcessor.merge_conversation_tokens(oasst_train_data)
-oasst_val_data = OASSTProcessor.merge_conversation_tokens(oasst_val_data)
-
-print(oasst_train_data[5])
-
+print(oasst_validation_data[:2])
+print(len(oasst_validation_data))
 

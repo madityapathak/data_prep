@@ -1,20 +1,17 @@
 from datasets import load_dataset
 
 
-class OpenOrcaProcessor:
+class DollyProcessor:
     USER_TOKEN = "<|USER|>"
     ASSISTANT_TOKEN = "<|ASSISTANT|>"
     EOS_TOKEN = "<|EOS|>"
     BOS_TOKEN = "<|BOS|>"
     EOT_TOKEN = "<|EOT|>"
 
-    def __init__(self, train_size="train[:500000]", test_size=0.01, seed=42):
-        dataset = load_dataset(
-            "Open-Orca/OpenOrca",
-            split=train_size,
-        )
+    def __init__(self, test_size=0.05, seed=42):
+        dataset = load_dataset("databricks/databricks-dolly-15k")
 
-        split = dataset.train_test_split(
+        split = dataset["train"].train_test_split(
             test_size=test_size,
             seed=seed,
         )
@@ -24,12 +21,18 @@ class OpenOrcaProcessor:
 
     @staticmethod
     def format_conversation(sample):
-        question = sample["question"].strip()
+        instruction = sample["instruction"].strip()
+        context = sample["context"].strip()
         response = sample["response"].strip()
 
+        if context:
+            user_message = f"{instruction}\n\n{context}"
+        else:
+            user_message = instruction
+
         return [
-            f"{OpenOrcaProcessor.USER_TOKEN}{question}{OpenOrcaProcessor.EOS_TOKEN}",
-            f"{OpenOrcaProcessor.ASSISTANT_TOKEN}{response}{OpenOrcaProcessor.EOS_TOKEN}",
+            f"{DollyProcessor.USER_TOKEN}{user_message}{DollyProcessor.EOS_TOKEN}",
+            f"{DollyProcessor.ASSISTANT_TOKEN}{response}{DollyProcessor.EOS_TOKEN}",
         ]
 
     @staticmethod
@@ -38,9 +41,9 @@ class OpenOrcaProcessor:
 
         for conversation in conversations:
             tokenized_conversations.append(
-                [OpenOrcaProcessor.BOS_TOKEN]
+                [DollyProcessor.BOS_TOKEN]
                 + conversation
-                + [OpenOrcaProcessor.EOT_TOKEN]
+                + [DollyProcessor.EOT_TOKEN]
             )
 
         return tokenized_conversations
@@ -79,15 +82,15 @@ class OpenOrcaProcessor:
         return self.build_dataset(self.validation_dataset)
 
 
-processor = OpenOrcaProcessor()
 
-openorca_train_data = processor.get_train_data()
-openorca_validation_data = processor.get_validation_data()
+processor = DollyProcessor()
 
-print(openorca_train_data[:2])
-print(len(openorca_train_data))
+dolly_train_data = processor.get_train_data()
+dolly_validation_data = processor.get_validation_data()
 
-print(openorca_validation_data[:2])
-print(len(openorca_validation_data))
+print(dolly_train_data[:2])
+print(len(dolly_train_data))
 
+print(dolly_validation_data[:2])
+print(len(dolly_validation_data))
 
