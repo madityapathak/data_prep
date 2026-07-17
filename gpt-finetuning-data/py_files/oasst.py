@@ -15,10 +15,10 @@ class OASSTProcessor:
 
     @staticmethod
     def build_conversations(messages):
-        parent_to_children = {}
-        message_lookup = {}
-        root_message_ids = []
-        conversations = []
+        parent_to_children      = {}
+        message_lookup          = {}
+        root_message_ids        = []
+        conversations           = []
 
         for message in messages:
             message_id = message["message_id"]
