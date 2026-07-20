@@ -61,9 +61,9 @@ class UltraChatProcessor:
                 self.format_conversation(sample)
             )
 
-        formatted_conversations = self.add_special_tokens(
-            formatted_conversations
-        )
+        # formatted_conversations = self.add_special_tokens(
+        #     formatted_conversations
+        # )
 
         formatted_conversations = self.merge_conversation_tokens(
             formatted_conversations

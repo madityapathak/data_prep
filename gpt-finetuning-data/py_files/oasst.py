@@ -144,9 +144,9 @@ class OASSTProcessor:
             message_lookup,
         )
 
-        formatted_conversations = self.add_special_tokens(
-            formatted_conversations
-        )
+        # formatted_conversations = self.add_special_tokens(
+        #     formatted_conversations
+        # )
 
         formatted_conversations = self.merge_conversation_tokens(
             formatted_conversations
@@ -171,6 +171,6 @@ oasst_validation_data = processor.get_validation_data()
 print(oasst_train_data[:2])
 print(len(oasst_train_data))
 
-print(oasst_validation_data[:2])
+print(oasst_validation_data[:3])
 print(len(oasst_validation_data))
 

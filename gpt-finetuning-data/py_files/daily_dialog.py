@@ -28,7 +28,7 @@ class DailyDialogProcessor:
 
         return formatted_messages
 
-    @staticmethod
+    @staticmethod   #----------> not a good idea to use currently
     def add_special_tokens(conversations):
         tokenized_conversations = []
 
@@ -58,9 +58,9 @@ class DailyDialogProcessor:
                 self._format_conversation(conversation)
             )
 
-        formatted_conversations = self.add_special_tokens(
-            formatted_conversations
-        )
+        # formatted_conversations = self.add_special_tokens(
+        #     formatted_conversations
+        # )
 
         formatted_conversations = self.merge_conversation_tokens(
             formatted_conversations
