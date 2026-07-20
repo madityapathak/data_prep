@@ -1,7 +1,7 @@
 import re
 from utils import num_tokens
 
-
+# This filter checks and keeps the first pair of input if needed
 class ConversationFilter:
     MAX_CONTEXT = 1004
 

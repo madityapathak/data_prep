@@ -66,12 +66,32 @@ class DatasetCleaner:
         pattern = re.compile(rf"\S{{{min_length},}}")
         return [pattern.sub("", text) for text in strings]
     
+    def clean(
+        self,
+        strings: list[str],
+        min_length: int = 41,
+    ) -> list[str]:
+        """
+        Run the complete cleaning pipeline.
+
+        Steps:
+        1. Remove conversations containing HTML tags.
+        2. Remove unwanted tagged content.
+        3. Remove long contiguous non-whitespace sequences.
+
+        Args:
+            strings: List of input strings.
+            min_length: Minimum length of a contiguous non-whitespace
+                sequence to remove.
+
+        Returns:
+            List of cleaned strings.
+        """
+        strings = self.clean_html_and_tags(strings)
+        strings = self.remove_long_word_sequences(strings, min_length=min_length)
+        return strings
 
 
 
-# cleaner = DatasetCleaner()
-
-# data = cleaner.clean_html_and_tags(data)
-# data = cleaner.remove_long_word_sequences(data)
-
+# data = cleaner.clean(data, min_length=50)
 
