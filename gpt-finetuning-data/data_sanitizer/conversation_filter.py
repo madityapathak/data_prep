@@ -1,16 +1,16 @@
 import re
-from utils import num_tokens
+from data_sanitizer.utils import num_tokens
 
 # This filter checks and keeps the first pair of input if needed
 class ConversationFilter:
     MAX_CONTEXT = 1004
 
     PAIR_PATTERN = re.compile(
-        r"(<\|user\|>.*?<\|eot\|>\s*<\|assistant\|>.*?<\|eot\|>)",
+        r"(<\|USER\|>.*?<\|EOT\|>\s*<\|ASSISTANT\|>.*?<\|EOT\|>)",
         re.DOTALL,
     )
 
-    ASSISTANT_PATTERN = re.compile(r"<\|assistant\|>")
+    ASSISTANT_PATTERN = re.compile(r"<\|ASSISTANT\|>")
 
     def filter_conversations(self, conversations):
         filtered_conversations = []
@@ -40,7 +40,7 @@ class ConversationFilter:
             if not pairs:
                 continue
 
-            first_pair = "<|bos|>" + pairs[0]
+            first_pair = "<|BOS|>" + pairs[0]
 
             # Keep only if the first pair fits
             if num_tokens(first_pair) <= self.MAX_CONTEXT:

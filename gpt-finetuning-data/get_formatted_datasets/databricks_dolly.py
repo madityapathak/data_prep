@@ -83,14 +83,14 @@ class DollyProcessor:
 
 
 
-processor = DollyProcessor()
+# processor = DollyProcessor()
 
-dolly_train_data = processor.get_train_data()
-dolly_validation_data = processor.get_validation_data()
+# dolly_train_data = processor.get_train_data()
+# dolly_validation_data = processor.get_validation_data()
 
-print(dolly_train_data[:2])
-print(len(dolly_train_data))
+# print(dolly_train_data[:2])
+# print(len(dolly_train_data))
 
-print(dolly_validation_data[:2])
-print(len(dolly_validation_data))
+# print(dolly_validation_data[:2])
+# print(len(dolly_validation_data))
 

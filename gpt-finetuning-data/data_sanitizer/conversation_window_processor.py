@@ -1,9 +1,10 @@
 import re
+from data_sanitizer.utils import num_tokens
 
 
 class ConversationWindowProcessor:
     PAIR_PATTERN = re.compile(
-        r"<\|user\|>.*?<\|eot\|>\s*<\|assistant\|>.*?<\|eot\|>",
+        r"<\|USER\|>.*?<\|EOT\|>\s*<\|ASSISTANT\|>.*?<\|EOT\|>",
         re.DOTALL,
     )
 

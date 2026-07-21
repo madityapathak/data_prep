@@ -77,13 +77,13 @@ class DailyDialogProcessor:
 
 
 
-processor = DailyDialogProcessor()
+# processor = DailyDialogProcessor()
 
-train_data = processor.get_train_data()
-validation_data = processor.get_validation_data()
+# train_data = processor.get_train_data()
+# validation_data = processor.get_validation_data()
 
-print(train_data[:2])
-print(len(train_data))
+# print(train_data[:2])
+# print(len(train_data))
 
 
 

@@ -79,15 +79,15 @@ class OpenOrcaProcessor:
         return self.build_dataset(self.validation_dataset)
 
 
-processor = OpenOrcaProcessor()
+# processor = OpenOrcaProcessor()
 
-openorca_train_data = processor.get_train_data()
-openorca_validation_data = processor.get_validation_data()
+# openorca_train_data = processor.get_train_data()
+# openorca_validation_data = processor.get_validation_data()
 
-print(openorca_train_data[:2])
-print(len(openorca_train_data))
+# print(openorca_train_data[:2])
+# print(len(openorca_train_data))
 
-print(openorca_validation_data[:2])
-print(len(openorca_validation_data))
+# print(openorca_validation_data[:2])
+# print(len(openorca_validation_data))
 
 

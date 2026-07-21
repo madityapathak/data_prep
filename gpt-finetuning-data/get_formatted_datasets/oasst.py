@@ -163,14 +163,14 @@ class OASSTProcessor:
 
 
 
-processor = OASSTProcessor()
+# processor = OASSTProcessor()
 
-oasst_train_data = processor.get_train_data()
-oasst_validation_data = processor.get_validation_data()
+# oasst_train_data = processor.get_train_data()
+# oasst_validation_data = processor.get_validation_data()
 
-print(oasst_train_data[:2])
-print(len(oasst_train_data))
+# print(oasst_train_data[:2])
+# print(len(oasst_train_data))
 
-print(oasst_validation_data[:3])
-print(len(oasst_validation_data))
+# print(oasst_validation_data[:3])
+# print(len(oasst_validation_data))
 
