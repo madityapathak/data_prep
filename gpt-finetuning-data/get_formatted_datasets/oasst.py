@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from utils import en_filter, dfs
+from .utils import en_filter, dfs
 
 
 class OASSTProcessor:
