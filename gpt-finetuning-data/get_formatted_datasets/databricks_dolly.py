@@ -1,4 +1,5 @@
 from datasets import load_dataset
+from get_formatted_datasets.utils import SEED
 
 
 class DollyProcessor:
@@ -8,7 +9,7 @@ class DollyProcessor:
     BOS_TOKEN = "<|BOS|>"
     EOT_TOKEN = "<|EOT|>"
 
-    def __init__(self, test_size=0.05, seed=42):
+    def __init__(self, test_size=0.05, seed=SEED):
         dataset = load_dataset("databricks/databricks-dolly-15k")
 
         split = dataset["train"].train_test_split(

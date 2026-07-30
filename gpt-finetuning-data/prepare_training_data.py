@@ -12,6 +12,7 @@ Pipeline:
 """
 
 import random
+import re
 from typing import List, Tuple
 
 # Import dataset processors
@@ -20,7 +21,7 @@ from get_formatted_datasets.databricks_dolly import DollyProcessor
 from get_formatted_datasets.oasst import OASSTProcessor
 from get_formatted_datasets.open_orca import OpenOrcaProcessor
 from get_formatted_datasets.ultrachat import UltraChatProcessor
-from get_formatted_datasets.utils import TARGETS
+from get_formatted_datasets.utils import TARGETS, SEED
 
 # Import sanitizers
 from data_sanitizer.dataset_cleaner import DatasetCleaner
@@ -32,7 +33,7 @@ from data_sanitizer.utils import num_tokens
 class DataPreparationPipeline:
     """Main pipeline for preparing fine-tuning data."""
     
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = SEED):
         """
         Initialize the data preparation pipeline.
         
@@ -222,8 +223,8 @@ class DataPreparationPipeline:
             
             train_data, validation_data = sanitized_data[dataset_name]
             
-            # Calculate proportional split (90% train, 10% validation)
-            train_target = int(target_tokens * 0.9)
+            # Calculate proportional split (100% train, 10% validation)
+            train_target = int(target_tokens * 1)
             validation_target = int(target_tokens * 0.1)
             
             # Sample train data
@@ -304,7 +305,7 @@ class DataPreparationPipeline:
 def main():
     """Main entry point."""
     # Initialize pipeline
-    pipeline = DataPreparationPipeline(seed=42)
+    pipeline = DataPreparationPipeline(seed=SEED)
     
     # Run pipeline
     final_train_data, final_validation_data = pipeline.run()

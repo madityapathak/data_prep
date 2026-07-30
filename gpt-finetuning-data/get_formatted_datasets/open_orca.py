@@ -1,5 +1,5 @@
 from datasets import load_dataset
-
+from .utils import SEED
 
 class OpenOrcaProcessor:
     USER_TOKEN = "<|USER|>"
@@ -8,7 +8,7 @@ class OpenOrcaProcessor:
     BOS_TOKEN = "<|BOS|>"
     EOT_TOKEN = "<|EOT|>"
 
-    def __init__(self, train_size="train[:500000]", test_size=0.01, seed=42):
+    def __init__(self, train_size="train[:500000]", test_size=0.01, seed=SEED):
         dataset = load_dataset(
             "Open-Orca/OpenOrca",
             split=train_size,

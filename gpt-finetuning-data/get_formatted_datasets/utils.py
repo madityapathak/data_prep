@@ -6,6 +6,7 @@ TARGETS = {
     "dolly":       10_000_000,
 }
 
+SEED = 65
 
 en_filter = lambda x: x["lang"] == "en"
 
