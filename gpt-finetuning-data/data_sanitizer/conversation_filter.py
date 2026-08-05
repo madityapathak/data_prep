@@ -6,7 +6,7 @@ class ConversationFilter:
     MAX_CONTEXT = 1004
 
     PAIR_PATTERN = re.compile(
-        r"(<\|USER\|>.*?<\|EOT\|>\s*<\|ASSISTANT\|>.*?<\|EOT\|>)",
+        r"(<\|USER\|>.*?<\|EOS\|>\s*<\|ASSISTANT\|>.*?<\|EOS\|>)",
         re.DOTALL,
     )
 
@@ -40,7 +40,8 @@ class ConversationFilter:
             if not pairs:
                 continue
 
-            first_pair = "<|BOS|>" + pairs[0]
+            # first_pair = "<|BOS|>" + pairs[0]
+            first_pair = pairs[0]
 
             # Keep only if the first pair fits
             if num_tokens(first_pair) <= self.MAX_CONTEXT:
