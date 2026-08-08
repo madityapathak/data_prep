@@ -8,7 +8,12 @@ Pipeline:
    - ConversationFilter: Filter by context length, separate multi-turn
    - ConversationWindowProcessor: Apply sliding window to long conversations
 3. Mix datasets according to target token counts
-4. Output final train and validation lists
+4. Pack sequences (TokenPacker):
+   - Wrap every entry with <|BOS|> and <|EOT|> text tokens
+   - Sort ascending by num_tokens, then merge consecutive entries that fit
+     within max_context (maximises GPU utilisation)
+   - Right-pad every sequence with <|PAD|> to exactly max_context tokens
+5. Save packed text strings to disk (no encoding — encode later when needed)
 """
 
 import random
@@ -27,6 +32,7 @@ from get_formatted_datasets.utils import TARGETS, SEED
 from data_sanitizer.dataset_cleaner import DatasetCleaner
 from data_sanitizer.conversation_filter import ConversationFilter
 from data_sanitizer.conversation_window_processor import ConversationWindowProcessor
+from data_sanitizer.token_packer import TokenPacker
 from data_sanitizer.utils import num_tokens
 
 
@@ -47,6 +53,12 @@ class DataPreparationPipeline:
         self.dataset_cleaner = DatasetCleaner()
         self.conversation_filter = ConversationFilter()
         self.conversation_window_processor = ConversationWindowProcessor(max_length=1010)
+
+        # Max context length (must match ConversationFilter.MAX_CONTEXT + BOS/EOT overhead)
+        self.max_context = 1024
+
+        # TokenPacker: adds BOS/EOT, merges small entries, pads to max_context
+        self.token_packer = TokenPacker(max_context=self.max_context)
         
         # Dataset processors
         self.processors = {
@@ -249,13 +261,54 @@ class DataPreparationPipeline:
         random.shuffle(final_validation_data)
         
         return final_train_data, final_validation_data
+
+    def pack_data(
+        self,
+        train_data: List[str],
+        validation_data: List[str],
+    ) -> "Tuple[List[str], List[str]]":
+        """
+        Apply TokenPacker post-processing to both splits.
+
+        For each split this:
+          1. Wraps every entry with <|BOS|> and <|EOT|> text tokens.
+          2. Sorts by num_tokens (ascending) then merges consecutive entries
+             so the combined token count stays within max_context.
+          3. Right-pads every sequence with <|PAD|> text tokens to exactly
+             max_context tokens.
+
+        No encoding is performed — strings are returned as-is so they can
+        be saved to disk and encoded later.
+
+        Args:
+            train_data:      List of sanitised training conversation strings.
+            validation_data: List of sanitised validation conversation strings.
+
+        Returns:
+            Tuple of (packed_train, packed_validation) where each element is
+            a list of packed, padded conversation strings.
+        """
+        print("\n" + "=" * 60)
+        print("STEP 4: Packing sequences (BOS/EOT → sort → merge → pad)")
+        print("=" * 60)
+
+        print("\nPacking train data...")
+        packed_train = self.token_packer.process(train_data)
+
+        print("\nPacking validation data...")
+        packed_validation = self.token_packer.process(validation_data)
+
+        return packed_train, packed_validation
     
-    def run(self) -> Tuple[List[str], List[str]]:
+    def run(self) -> "Tuple[List[str], List[str]]":
         """
         Run the complete data preparation pipeline.
-        
+
         Returns:
-            Tuple of (final_train_data, final_validation_data)
+            Tuple of (packed_train_data, packed_validation_data) where each
+            element is a list of packed, padded conversation strings (with
+            <|BOS|>, <|EOT|>, and <|PAD|> special tokens in text form).
+            No encoding is performed.
         """
         print("\n" + "=" * 60)
         print("STARTING DATA PREPARATION PIPELINE")
@@ -269,63 +322,79 @@ class DataPreparationPipeline:
         
         # Step 3: Mix datasets according to targets
         final_train_data, final_validation_data = self.mix_datasets(sanitized_data)
-        
-        # Final statistics
+
+        # Intermediate statistics (pre-packing)
         print("\n" + "=" * 60)
-        print("FINAL STATISTICS")
+        print("PRE-PACK STATISTICS")
         print("=" * 60)
-        
+
         train_tokens = self.calculate_total_tokens(final_train_data)
         validation_tokens = self.calculate_total_tokens(final_validation_data)
         total_tokens = train_tokens + validation_tokens
-        
-        print(f"\nTrain Data:")
-        print(f"  Conversations: {len(final_train_data):,}")
-        print(f"  Tokens: {train_tokens:,}")
-        
-        print(f"\nValidation Data:")
-        print(f"  Conversations: {len(final_validation_data):,}")
-        print(f"  Tokens: {validation_tokens:,}")
-        
-        print(f"\nTotal:")
-        print(f"  Conversations: {len(final_train_data) + len(final_validation_data):,}")
-        print(f"  Tokens: {total_tokens:,}")
-        
+
+        print(f"\nTrain Data (text):")
+        print(f"  Conversations : {len(final_train_data):,}")
+        print(f"  Tokens        : {train_tokens:,}")
+
+        print(f"\nValidation Data (text):")
+        print(f"  Conversations : {len(final_validation_data):,}")
+        print(f"  Tokens        : {validation_tokens:,}")
+
         target_total = sum(TARGETS.values())
-        print(f"\nTarget Total Tokens: {target_total:,}")
-        print(f"Achievement Rate: {(total_tokens / target_total * 100):.2f}%")
-        
+        print(f"\nTarget Total Tokens  : {target_total:,}")
+        print(f"Achievement Rate     : {(total_tokens / target_total * 100):.2f}%")
+
+        # Step 4: Pack sequences (BOS/EOT + sort + merge + pad)
+        packed_train, packed_validation = self.pack_data(
+            final_train_data, final_validation_data
+        )
+
+        # Final statistics (post-packing)
+        print("\n" + "=" * 60)
+        print("FINAL STATISTICS (packed sequences)")
+        print("=" * 60)
+
+        print(f"\nTrain Data:")
+        print(f"  Sequences     : {len(packed_train):,}")
+        print(f"  Tokens each   : {self.max_context}")
+        print(f"  Total tokens  : {len(packed_train) * self.max_context:,}")
+
+        print(f"\nValidation Data:")
+        print(f"  Sequences     : {len(packed_validation):,}")
+        print(f"  Tokens each   : {self.max_context}")
+        print(f"  Total tokens  : {len(packed_validation) * self.max_context:,}")
+
         print("\n" + "=" * 60)
         print("PIPELINE COMPLETED")
         print("=" * 60)
-        
-        return final_train_data, final_validation_data
+
+        return packed_train, packed_validation
 
 
 def main():
     """Main entry point."""
     # Initialize pipeline
     pipeline = DataPreparationPipeline(seed=SEED)
-    
-    # Run pipeline
-    final_train_data, final_validation_data = pipeline.run()
-    
-    # Optionally save to files
-    print("\nSaving data to files...")
-    
+
+    # Run pipeline – returns packed, padded text strings (no encoding)
+    packed_train, packed_validation = pipeline.run()
+
+    # Save packed text strings: one packed sequence per line
+    print("\nSaving packed sequences to files...")
+
     with open("final_train_data.txt", "w", encoding="utf-8") as f:
-        for conversation in final_train_data:
-            f.write(conversation + "\n\n")
-    
+        for seq in packed_train:
+            f.write(seq + "\n")
+
     with open("final_validation_data.txt", "w", encoding="utf-8") as f:
-        for conversation in final_validation_data:
-            f.write(conversation + "\n\n")
-    
+        for seq in packed_validation:
+            f.write(seq + "\n")
+
     print("✓ Saved final_train_data.txt")
     print("✓ Saved final_validation_data.txt")
-    
-    return final_train_data, final_validation_data
+
+    return packed_train, packed_validation
 
 
 if __name__ == "__main__":
-    final_train_data, final_validation_data = main()
+    main()
