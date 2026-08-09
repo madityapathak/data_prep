@@ -10,13 +10,12 @@ Pipeline:
 3. Mix datasets according to target token counts
 4. Pack sequences (TokenPacker):
    - Wrap every entry with <|BOS|> and <|EOT|> text tokens
+   - Validate structure (BOS/EOT boundaries, USER-first, ASSISTANT-last, strict alternation)
    - Sort ascending by num_tokens, then merge consecutive entries that fit
      within max_context (maximises GPU utilisation)
    - Right-pad every sequence with <|PAD|> to exactly max_context tokens
-5. Validate packed sequences (ConversationValidator):
-   - Confirm BOS/EOT boundaries, USER-first, ASSISTANT-last, strict alternation
-   - Raises ValueError and halts if any invalid sequences are found
-6. Write NumPy shards (ShardWriter):
+   - Invalid sequences are logged to a file for inspection
+5. Write NumPy shards (ShardWriter):
    - Encode validated strings to uint16 token arrays
    - Respect conversation boundaries — never split a conversation across shards
    - Write fixed-size shards (2^25 ≈ 32 M tokens) for efficient DataLoader use
@@ -39,7 +38,6 @@ from data_sanitizer.dataset_cleaner import DatasetCleaner
 from data_sanitizer.conversation_filter import ConversationFilter
 from data_sanitizer.conversation_window_processor import ConversationWindowProcessor
 from data_sanitizer.token_packer import TokenPacker
-from data_sanitizer.conversation_validator import ConversationValidator
 from data_sanitizer.shard_writer import ShardWriter, SHARD_SIZE
 from data_sanitizer.utils import num_tokens
 
@@ -67,10 +65,6 @@ class DataPreparationPipeline:
 
         # TokenPacker: adds BOS/EOT, merges small entries, pads to max_context
         self.token_packer = TokenPacker(max_context=self.max_context)
-
-        # ConversationValidator: runs immediately after BOS/EOT are added;
-        # strict=True means the pipeline halts on any invalid sequence.
-        self.conversation_validator = ConversationValidator(strict=True)
 
         # Dataset processors
         self.processors = {
@@ -320,15 +314,13 @@ class DataPreparationPipeline:
         val_shard_dir: str = "shards/val",
     ) -> "Tuple[List[str], List[str]]":
         """
-        Validate packed sequences then write NumPy shards for each split.
+        Write NumPy shards for each split.
 
         This method must be called **after** pack_data() because it expects
         sequences that already carry <|BOS|> and <|EOT|> boundaries.
 
         Steps (per split):
-          1. ConversationValidator checks all 5 structural rules on the
-             tokenized representation.  Raises ValueError on failure.
-          2. ShardWriter encodes each valid sequence to uint16 token IDs
+          1. ShardWriter encodes each sequence to uint16 token IDs
              and writes fixed-size (2^25 token) .npy shard files while
              keeping every conversation intact within a single shard.
 
@@ -339,33 +331,23 @@ class DataPreparationPipeline:
             val_shard_dir:     Output directory for validation shards.
 
         Returns:
-            Tuple of (valid_packed_train, valid_packed_validation) — the
-            subsets that passed validation (order preserved).
+            Tuple of (packed_train, packed_validation) — the original input
+            sequences (order preserved).
         """
         print("\n" + "=" * 60)
-        print("STEP 5: Validating packed sequences")
-        print("=" * 60)
-
-        print("\nValidating train data...")
-        valid_train = self.conversation_validator.validate(packed_train)
-
-        print("\nValidating validation data...")
-        valid_validation = self.conversation_validator.validate(packed_validation)
-
-        print("\n" + "=" * 60)
-        print("STEP 6: Writing NumPy shards")
+        print("STEP 5: Writing NumPy shards")
         print(f"        Shard size : {SHARD_SIZE:,} tokens (2^25 ≈ 32 M)")
         print("=" * 60)
 
         print("\nWriting train shards...")
         train_writer = ShardWriter(output_dir=train_shard_dir, split="train")
-        train_writer.write(valid_train)
+        train_writer.write(packed_train)
 
         print("\nWriting validation shards...")
         val_writer = ShardWriter(output_dir=val_shard_dir, split="val")
-        val_writer.write(valid_validation)
+        val_writer.write(packed_validation)
 
-        return valid_train, valid_validation
+        return packed_train, packed_validation
 
     def run(self) -> "Tuple[List[str], List[str]]":
         """
@@ -431,7 +413,7 @@ class DataPreparationPipeline:
         print(f"  Tokens each   : {self.max_context}")
         print(f"  Total tokens  : {len(packed_validation) * self.max_context:,}")
 
-        # Steps 5 + 6: Validate then shard
+        # Step 5: Shard (validation happens inside TokenPacker)
         valid_train, valid_validation = self.validate_and_shard(
             packed_train, packed_validation
         )
@@ -441,12 +423,12 @@ class DataPreparationPipeline:
         print("FINAL STATISTICS")
         print("=" * 60)
 
-        print(f"\nTrain Data (validated):")
+        print(f"\nTrain Data:")
         print(f"  Sequences     : {len(valid_train):,}")
         print(f"  Tokens each   : {self.max_context}")
         print(f"  Total tokens  : {len(valid_train) * self.max_context:,}")
 
-        print(f"\nValidation Data (validated):")
+        print(f"\nValidation Data:")
         print(f"  Sequences     : {len(valid_validation):,}")
         print(f"  Tokens each   : {self.max_context}")
         print(f"  Total tokens  : {len(valid_validation) * self.max_context:,}")

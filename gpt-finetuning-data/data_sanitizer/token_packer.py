@@ -1,4 +1,7 @@
 from data_sanitizer.utils import num_tokens
+from data_sanitizer.conversation_validator import ConversationValidator
+import os
+from datetime import datetime
 
 
 class TokenPacker:
@@ -9,8 +12,9 @@ class TokenPacker:
     EOT_TOKEN = "<|EOT|>"
     PAD_TOKEN = "<|PAD|>"
 
-    def __init__(self, max_context: int = 1024):
+    def __init__(self, max_context: int = 1024, invalid_data_log: str = "invalid_sequences.txt"):
         self.max_context = max_context
+        self.invalid_data_log = invalid_data_log
 
     # ------------------------------------------------------------------ #
     # Step 1 – Wrap each conversation string with BOS / EOT
@@ -116,6 +120,41 @@ class TokenPacker:
         return padded
 
     # ------------------------------------------------------------------ #
+    # Helper method to log invalid sequences
+    # ------------------------------------------------------------------ #
+    def _log_invalid_sequences(self, wrapped: list[str], invalid_results: list) -> None:
+        """
+        Log invalid sequences to a text file for inspection.
+        
+        Args:
+            wrapped: List of all wrapped sequences (before filtering)
+            invalid_results: List of ValidationResult objects for invalid sequences
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Create or append to the log file
+        file_exists = os.path.exists(self.invalid_data_log)
+        
+        with open(self.invalid_data_log, "a", encoding="utf-8") as f:
+            # Add separator if file already exists
+            if file_exists:
+                f.write("\n" + "=" * 80 + "\n")
+            
+            # Write header
+            f.write(f"Invalid Sequences Log - {timestamp}\n")
+            f.write(f"Total Invalid: {len(invalid_results)}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # Write each invalid sequence with its failure reasons
+            for result in invalid_results:
+                f.write(f"Sequence #{result.index}\n")
+                f.write(f"Reasons: {'; '.join(result.reasons)}\n")
+                f.write(f"Content:\n")
+                f.write(wrapped[result.index])
+                f.write("\n")
+                f.write("-" * 80 + "\n\n")
+
+    # ------------------------------------------------------------------ #
     # Full Pipeline
     # ------------------------------------------------------------------ #
     def process(self, conversations: list[str]) -> list[str]:
@@ -133,6 +172,30 @@ class TokenPacker:
         # Step 1 – wrap with BOS / EOT
         wrapped = self.wrap_with_special_tokens(conversations)
         print(f"  [TokenPacker] Wrapped         : {len(wrapped):,} sequences")
+
+
+        # Step 1.5 – validate structure before bin-packing
+        # Expected format per sequence:
+        #   <|BOS|><|USER|>...<|EOS|><|ASSISTANT|>...<|EOS|>...<|ASSISTANT|>...<|EOS|><|EOT|>
+        # Rules:
+        #   1. Must start with <|BOS|>  2. Must end with <|EOT|>
+        #   3. First turn must be USER  4. Last turn must be ASSISTANT
+        #   5. USER / ASSISTANT turns must strictly alternate
+        validator = ConversationValidator(strict=False)  # filter, don't raise
+        
+        # Use validate_with_report to get both valid sequences and validation results
+        valid_wrapped, validation_results = validator.validate_with_report(wrapped)
+        
+        # Log invalid sequences to file
+        invalid_results = [r for r in validation_results if not r.passed]
+        if invalid_results:
+            self._log_invalid_sequences(wrapped, invalid_results)
+            print(f"  [TokenPacker] Logged {len(invalid_results):,} invalid sequences to '{self.invalid_data_log}'")
+        
+        wrapped = valid_wrapped
+        print(f"  [TokenPacker] After validation : {len(wrapped):,} sequences passed")
+
+
 
         # Step 2 – sort & bin-pack
         packed = self.pack_entries(wrapped)
