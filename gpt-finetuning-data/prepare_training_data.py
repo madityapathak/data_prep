@@ -31,6 +31,7 @@ from get_formatted_datasets.databricks_dolly import DollyProcessor
 from get_formatted_datasets.oasst import OASSTProcessor
 from get_formatted_datasets.open_orca import OpenOrcaProcessor
 from get_formatted_datasets.ultrachat import UltraChatProcessor
+from get_formatted_datasets.static_conversations import StaticConversationsProcessor
 from get_formatted_datasets.utils import TARGETS, SEED
 
 # Import sanitizers
@@ -73,6 +74,7 @@ class DataPreparationPipeline:
             "oasst": OASSTProcessor(),
             "openorca": OpenOrcaProcessor(),
             "ultrachat": UltraChatProcessor(),
+            "static": StaticConversationsProcessor(),
         }
         
     def load_raw_data(self) -> dict:

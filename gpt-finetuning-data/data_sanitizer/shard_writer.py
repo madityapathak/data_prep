@@ -153,6 +153,7 @@ class ShardWriter:
             # Flush any buffered tokens first, then write this conversation
             # as its own oversized shard.
             if conv_len > self.shard_size:
+                print("[DEBUG] THIS PRINT SHOULD NEVER BE IN TERMINAL AS conv_len > shard_size IS NEVER GOING TO BE TRUE")
                 print(
                     f"\n  [ShardWriter] ⚠ Oversized conversation: {conv_len:,} tokens "
                     f"> shard_size {self.shard_size:,}.  Writing as standalone shard."

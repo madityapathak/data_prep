@@ -4,6 +4,7 @@ TARGETS = {
     "oasst":       40_000_000,
     "dailydialog": 15_000_000,
     "dolly":       10_000_000,
+    "static":       5_000_000,  # Static human conversations
 }
 
 SEED = 65
