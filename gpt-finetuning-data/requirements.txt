@@ -5,3 +5,5 @@ notebook==7.6.0
 numpy>=1.24
 tiktoken==0.5.1
 tqdm>=4.65
+pytest==9.1.1
+torch==2.13.0
