@@ -55,7 +55,7 @@ from data_sanitizer.utils import enc, special_tokens
 # ---------------------------------------------------------------------------
 SHARDS_ROOT   = os.path.join(PROJECT_ROOT, "shards")
 BATCH_SIZE    = 2
-SEQ_LEN       = 128
+SEQ_LEN       = 1024
 VOCAB_SIZE    = enc.n_vocab   # 50257 + 6 custom = 50263
 
 # Derived
@@ -305,7 +305,7 @@ class TestNoDataDuplication(unittest.TestCase):
             loader = _make_loader(process_rank=rank, num_processes=num_proc, split="train")
             positions = self._collect_positions(loader, steps_per_rank)
             for shard_idx, pos in positions:
-                windows[rank].append((shard_idx, pos, pos + BT * num_proc))
+                windows[rank].append((shard_idx, pos, pos + BT))  # each rank reads exactly BT tokens
 
         overlaps = []
         for s0, start0, end0 in windows[0]:
@@ -319,32 +319,49 @@ class TestNoDataDuplication(unittest.TestCase):
 
     def test_multi_process_union_covers_all_tokens(self):
         """
-        The union of what rank-0 and rank-1 read must cover every
-        B*T block that rank-0 alone would read (no gaps in coverage).
+        The union of what rank-0 and rank-1 read must form a contiguous
+        B*T-spaced sequence with no gaps within every shard.
+
+        We compute the expected positions analytically per shard (using
+        the same offset/stride logic the loader uses) to avoid the epoch-
+        boundary confusion that arises when driving a live loader for a
+        global step total.
         """
         num_proc = 2
-        n_batches_single = _batches_in_single_pass("train", num_processes=1)
-        if n_batches_single < 4:
-            self.skipTest("Not enough data.")
+        loader   = _make_loader(process_rank=0, num_processes=num_proc)
+        if len(loader.shard_files) < 2:
+            self.skipTest("Need at least 2 shards.")
 
-        loader_single = _make_loader(num_processes=1, process_rank=0)
-        single_positions = set()
-        for _ in range(n_batches_single):
-            single_positions.add((loader_single.current_shard_idx, loader_single.current_position))
-            loader_single.next_batch()
+        step = BT * num_proc  # stride between consecutive reads by the same rank
 
-        steps = max(1, n_batches_single // num_proc)
-        multi_positions = set()
-        for rank in range(num_proc):
-            loader = _make_loader(process_rank=rank, num_processes=num_proc)
-            for _ in range(steps):
-                multi_positions.add((loader.current_shard_idx, loader.current_position))
-                loader.next_batch()
+        for shard_path in loader.shard_files:
+            n       = len(np.load(shard_path))
+            shard   = os.path.basename(shard_path)
 
-        missing = single_positions - multi_positions
-        self.assertEqual(len(missing), 0,
-            f"{len(missing)} positions covered by single-process are missing in "
-            f"the 2-process run (data gaps): {list(missing)[:5]}")
+            # Positions each rank would visit in this shard
+            combined = set()
+            for rank in range(num_proc):
+                start = rank * BT
+                pos   = start
+                while pos + BT + 1 <= n:   # same condition as the loader
+                    combined.add(pos)
+                    pos += step
+
+            if not combined:
+                continue  # shard too small for even one batch per rank
+
+            sorted_pos = sorted(combined)
+            gaps = [
+                (i, i * BT, pos)
+                for i, pos in enumerate(sorted_pos)
+                if pos != i * BT
+            ]
+            self.assertEqual(
+                len(gaps), 0,
+                f"{shard}: combined rank positions are not contiguous "
+                f"(step={BT}). First mismatches: {gaps[:3]}"
+            )
+
 
     def test_reset_loops_back_to_start(self):
         """

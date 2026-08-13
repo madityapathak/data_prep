@@ -78,7 +78,7 @@ IS_MASTER = (RANK == 0)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BATCH_SIZE  = 2
-SEQ_LEN     = 128
+SEQ_LEN     = 1024
 BT          = BATCH_SIZE * SEQ_LEN          # tokens per batch step per rank
 SHARDS_ROOT = os.path.join(PROJECT_ROOT, "shards")
 VOCAB_SIZE  = enc.n_vocab
