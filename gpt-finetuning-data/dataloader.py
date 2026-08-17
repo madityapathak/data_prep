@@ -32,7 +32,191 @@ def load_shard_tokens(filename: str) -> torch.Tensor:
     return torch.tensor(token_array, dtype=torch.long)
 
 
+
+
 class ConversationDataLoader:
+    def __init__(
+        self,
+        batch_size,
+        sequence_length,
+        process_rank=0,
+        num_processes=1,
+        split='train',
+        data_root='shards'
+    ):
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+
+        assert split in {'train', 'val'}, \
+            f"Split must be 'train' or 'val', got '{split}'"
+        self.split = split
+
+        shard_dir = os.path.join(data_root, split)
+
+        if not os.path.exists(shard_dir):
+            raise ValueError(f"Shard directory does not exist: {shard_dir}")
+
+        all_files = os.listdir(shard_dir)
+        shard_files = [
+            f for f in all_files
+            if f.startswith(split) and f.endswith('.npy')
+        ]
+        shard_files = sorted(shard_files)
+
+        if not shard_files:
+            raise ValueError(
+                f"No shard files found in {shard_dir} for split '{split}'"
+            )
+
+        self.shard_files = [
+            os.path.join(shard_dir, f)
+            for f in shard_files
+        ]
+
+        self.reset()
+
+    def reset(self):
+        self.current_shard_idx = 0
+        self.tokens = load_shard_tokens(
+            self.shard_files[self.current_shard_idx]
+        )
+
+        tokens_per_batch = self.batch_size * self.sequence_length
+
+        # CHANGED:
+        # Number of tokens consumed by ALL processes for one training step.
+        self.distributed_step_tokens = (
+            tokens_per_batch * self.num_processes
+        )
+
+        # CHANGED:
+        # Calculate how many complete distributed steps fit in this shard.
+        # -1 is required because each batch needs T+1 tokens.
+        usable_tokens = len(self.tokens) - 1
+
+        self.steps_in_shard = (
+            usable_tokens // self.distributed_step_tokens
+        )
+
+        # CHANGED:
+        # Each rank starts at its own section of the first distributed batch.
+        self.current_step = 0
+        self.current_position = (
+            tokens_per_batch * self.process_rank
+        )
+
+        print(
+            f"Reset to shard 0, "
+            f"position {self.current_position}, "
+            f"steps_in_shard {self.steps_in_shard}"
+        )
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T = self.batch_size, self.sequence_length
+
+        # CHANGED:
+        # Instead of checking independently whether the current position
+        # is beyond the shard, use the same step count for every rank.
+        if self.current_step >= self.steps_in_shard:
+            self._advance_to_next_shard()
+
+        # T + 1 tokens are required to create input and target.
+        tokens_needed = B * T + 1
+
+        start_pos = self.current_position
+        end_pos = start_pos + tokens_needed
+
+        token_sequence = self.tokens[start_pos:end_pos]
+
+        input_tokens = token_sequence[:-1]
+        target_tokens = token_sequence[1:]
+
+        inputs = input_tokens.view(B, T)
+        targets = target_tokens.view(B, T)
+
+        # CHANGED:
+        # Move to the next distributed batch.
+        # Every rank advances by the total amount consumed by all ranks.
+        self.current_position += (
+            B * T * self.num_processes
+        )
+
+        # CHANGED:
+        self.current_step += 1
+
+        return inputs, targets
+
+    def _advance_to_next_shard(self):
+        self.current_shard_idx = (
+            self.current_shard_idx + 1
+        ) % len(self.shard_files)
+
+        shard_path = self.shard_files[self.current_shard_idx]
+        self.tokens = load_shard_tokens(shard_path)
+
+        # CHANGED:
+        # Recalculate how many complete distributed steps
+        # are available in the new shard.
+        usable_tokens = len(self.tokens) - 1
+
+        self.steps_in_shard = (
+            usable_tokens // self.distributed_step_tokens
+        )
+
+        # CHANGED:
+        # Reset the step counter for the new shard.
+        self.current_step = 0
+
+        # CHANGED:
+        # Every rank starts at its own section of the first
+        # distributed batch in the new shard.
+        tokens_per_batch = self.batch_size * self.sequence_length
+
+        self.current_position = (
+            tokens_per_batch * self.process_rank
+        )
+
+        print(
+            f"Advanced to shard {self.current_shard_idx}, "
+            f"position {self.current_position}, "
+            f"steps_in_shard {self.steps_in_shard}"
+        )
+
+
+
+    def get_stats(self) -> dict:
+        """
+        Get statistics about the loaded data.
+        
+        Returns:
+            Dictionary containing data statistics
+        """
+        total_tokens = 0
+        shard_info = []
+        
+        for shard_path in self.shard_files:
+            tokens = load_shard_tokens(shard_path)
+            num_tokens = len(tokens)
+            total_tokens += num_tokens
+            
+            shard_info.append({
+                'filename': os.path.basename(shard_path),
+                'tokens': num_tokens
+            })
+        
+        return {
+            'split': self.split,
+            'num_shards': len(self.shard_files),
+            'total_tokens': total_tokens,
+            'shard_info': shard_info,
+            'avg_tokens_per_shard': total_tokens / len(self.shard_files) if self.shard_files else 0
+        }
+
+
+
+class ConversationDataLoader_old:
     """
     Simple dataloader for conversation training data stored in shards.
     

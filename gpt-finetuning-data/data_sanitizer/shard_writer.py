@@ -58,8 +58,8 @@ from data_sanitizer.utils import enc, special_tokens
 # Constants
 # ---------------------------------------------------------------------------
 
-# 2^25 = 33 554 432 tokens ≈ 32 M tokens per shard
-SHARD_SIZE: int = 2 ** 25
+# 2^26 = 67 108 864 tokens ≈ 64 M tokens per shard
+SHARD_SIZE: int = 2 ** 26
 
 # GPT-2 base vocab has 50 257 tokens; our custom encoder adds 6 specials
 # → maximum token ID = 50 262, well within uint16 range (65 535).
