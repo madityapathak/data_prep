@@ -1,3 +1,16 @@
 DATALOADER LOGIC NEEDS TO BE TESTED PROPERLY
-LOGIC TO MASK THE USER TOKEN AND PADDING TOKENS NEEDS TO BE IMPLEMENTED
+  -> DONE: tests/test_dataloader.py covers batch shapes, masking, no-duplication,
+           multi-process partitioning, full-epoch exhaustion, and edge cases.
 
+LOGIC TO MASK THE USER TOKEN AND PADDING TOKENS NEEDS TO BE IMPLEMENTED
+  -> DONE: dataloader.py::build_loss_mask() masks USER-turn + PAD tokens (target=-100).
+           model.py::forward() uses ignore_index=-100 in cross_entropy. (prev session)
+
+vocab_size in GPTConfig must be updated from 50257 to match custom tokenizer
+  -> DONE: model.py::GPTConfig.vocab_size updated to 50263
+           (50257 base + 6 custom tokens: BOS, USER, ASSISTANT, EOT, PAD, EOS)
+           from_pretrained() still uses 50257 for checkpoint compatibility.
+
+TRAINING SANITY SHOULD BE VERIFIED BEFORE RENTING GPU
+  -> DONE: tests/test_training_sanity.py - runs a tiny GPT model on synthetic data
+           (CPU-only, no shards needed, ~5 seconds).

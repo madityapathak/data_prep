@@ -1,48 +1,118 @@
 """
-Simple DataLoader for GPT Fine-tuning Training Data
+DataLoader for GPT Chat Fine-tuning
 
-This dataloader loads tokenized conversation data from NumPy shard files
-created by the data preparation pipeline. It's designed to be simple,
-readable, and easy to understand.
+Loads tokenised conversation shards (created by ShardWriter) and produces
+(input, target) batches with a loss mask already applied:
 
-The dataloader works with shards created by ShardWriter, which contain
-tokenized conversation data stored as uint16 numpy arrays.
+    - <|USER|> turns   → target = -100  (masked, not learned)
+    - <|PAD|> tokens   → target = -100  (masked, not learned)
+    - <|ASSISTANT|> turns → target = real token  (learned)
+
+cross_entropy with ignore_index=-100 will automatically skip masked positions,
+so the model only trains to predict ASSISTANT responses.
+
+Token format inside each shard sequence:
+    <|BOS|> <|USER|> ... <|EOS|> <|ASSISTANT|> ... <|EOS|> ... <|EOT|> <|PAD|>...
 """
 
 import os
 import torch
 import numpy as np
-from typing import List, Optional
-from data_sanitizer.utils import enc
+from data_sanitizer.utils import enc, special_tokens
 
+
+# ---------------------------------------------------------------------------
+# Special token IDs (resolved once at import time)
+# ---------------------------------------------------------------------------
+USER_TOKEN_ID      = special_tokens["<|USER|>"]
+ASSISTANT_TOKEN_ID = special_tokens["<|ASSISTANT|>"]
+PAD_TOKEN_ID       = special_tokens["<|PAD|>"]
+EOS_TOKEN_ID       = special_tokens["<|EOS|>"]
+EOT_TOKEN_ID       = special_tokens["<|EOT|>"]
+
+IGNORE_INDEX = -100   # value used by cross_entropy to skip a position
+
+
+# ---------------------------------------------------------------------------
+# Shard loading
+# ---------------------------------------------------------------------------
 
 def load_shard_tokens(filename: str) -> torch.Tensor:
     """
-    Load tokens from a numpy shard file and convert to PyTorch tensor.
-    
-    Args:
-        filename: Path to the .npy shard file
-        
-    Returns:
-        PyTorch tensor containing token IDs as long integers
+    Load a .npy shard (uint16) and return a torch.long tensor of token IDs.
     """
-    # Load numpy array (uint16) and convert to int32 then to torch.long
-    token_array = np.load(filename)
-    token_array = token_array.astype(np.int32)
+    token_array = np.load(filename).astype(np.int32)
     return torch.tensor(token_array, dtype=torch.long)
 
 
+# ---------------------------------------------------------------------------
+# Loss-mask builder
+# ---------------------------------------------------------------------------
 
+def build_loss_mask(token_sequence: torch.Tensor) -> torch.Tensor:
+    """
+    Given a flat 1-D token sequence, return a boolean mask of the same length
+    where True means "this position should contribute to the loss".
+
+    Rules:
+        - <|PAD|> tokens are always masked (False).
+        - Control tokens (<|USER|>, <|ASSISTANT|>, <|BOS|>, <|EOT|>) are masked.
+        - Content tokens inside a USER turn are masked (False).
+        - Content tokens inside an ASSISTANT turn, including the closing <|EOS|>,
+          are unmasked (True).
+
+    The sequence is scanned left-to-right. We start in 'masked' mode and
+    flip to 'unmasked' after each <|ASSISTANT|> token, then back to 'masked'
+    after each <|EOS|> that closes an ASSISTANT turn.
+    """
+    mask = torch.zeros(len(token_sequence), dtype=torch.bool)
+    in_assistant_turn = False
+
+    for i, token_id in enumerate(token_sequence.tolist()):
+        if token_id == ASSISTANT_TOKEN_ID:
+            in_assistant_turn = True
+            mask[i] = False          # the control token itself is not a target
+        elif token_id == EOS_TOKEN_ID and in_assistant_turn:
+            mask[i] = True           # include the closing <|EOS|> in the loss
+            in_assistant_turn = False
+        elif token_id == PAD_TOKEN_ID:
+            mask[i] = False
+        elif in_assistant_turn:
+            mask[i] = True
+
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Main DataLoader
+# ---------------------------------------------------------------------------
 
 class ConversationDataLoader:
+    """
+    Shard-based dataloader for chat fine-tuning.
+
+    Each call to next_batch() returns:
+        inputs  : (B, T) long tensor — token IDs fed into the model
+        targets : (B, T) long tensor — next-token targets with -100 for
+                  positions the model should NOT learn (USER turns + PAD)
+
+    Args:
+        batch_size      : Number of sequences per batch (B)
+        sequence_length : Context window length (T)
+        process_rank    : This process's DDP rank (0 for single-GPU)
+        num_processes   : Total number of DDP processes (1 for single-GPU)
+        split           : 'train' or 'val'
+        data_root       : Root directory that contains train/ and val/ shard folders
+    """
+
     def __init__(
         self,
-        batch_size,
-        sequence_length,
-        process_rank=0,
-        num_processes=1,
-        split='train',
-        data_root='shards'
+        batch_size: int,
+        sequence_length: int,
+        process_rank: int = 0,
+        num_processes: int = 1,
+        split: str = 'train',
+        data_root: str = 'shards'
     ):
         self.batch_size = batch_size
         self.sequence_length = sequence_length
@@ -54,381 +124,152 @@ class ConversationDataLoader:
         self.split = split
 
         shard_dir = os.path.join(data_root, split)
-
         if not os.path.exists(shard_dir):
             raise ValueError(f"Shard directory does not exist: {shard_dir}")
 
-        all_files = os.listdir(shard_dir)
-        shard_files = [
-            f for f in all_files
+        shard_files = sorted(
+            f for f in os.listdir(shard_dir)
             if f.startswith(split) and f.endswith('.npy')
-        ]
-        shard_files = sorted(shard_files)
-
+        )
         if not shard_files:
-            raise ValueError(
-                f"No shard files found in {shard_dir} for split '{split}'"
-            )
+            raise ValueError(f"No shard files found in {shard_dir} for split '{split}'")
 
-        self.shard_files = [
-            os.path.join(shard_dir, f)
-            for f in shard_files
-        ]
-
+        self.shard_files = [os.path.join(shard_dir, f) for f in shard_files]
         self.reset()
 
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+
     def reset(self):
+        """Reset to the beginning of the first shard."""
         self.current_shard_idx = 0
-        self.tokens = load_shard_tokens(
-            self.shard_files[self.current_shard_idx]
-        )
+        self._load_shard(self.current_shard_idx)
 
-        tokens_per_batch = self.batch_size * self.sequence_length
-
-        # CHANGED:
-        # Number of tokens consumed by ALL processes for one training step.
-        self.distributed_step_tokens = (
-            tokens_per_batch * self.num_processes
-        )
-
-        # CHANGED:
-        # Calculate how many complete distributed steps fit in this shard.
-        # -1 is required because each batch needs T+1 tokens.
-        usable_tokens = len(self.tokens) - 1
-
-        self.steps_in_shard = (
-            usable_tokens // self.distributed_step_tokens
-        )
-
-        # CHANGED:
-        # Each rank starts at its own section of the first distributed batch.
+        tokens_per_rank = self.batch_size * self.sequence_length
+        self.current_position = tokens_per_rank * self.process_rank
         self.current_step = 0
-        self.current_position = (
-            tokens_per_batch * self.process_rank
-        )
 
-        print(
-            f"Reset to shard 0, "
-            f"position {self.current_position}, "
-            f"steps_in_shard {self.steps_in_shard}"
-        )
+    def _load_shard(self, idx: int):
+        """Load the shard at index idx and pre-build its loss mask."""
+        shard_path = self.shard_files[idx]
+        self.tokens = load_shard_tokens(shard_path)
+
+        # Pre-build the loss mask for the whole shard in one pass
+        self.loss_mask = build_loss_mask(self.tokens)
+
+        tokens_per_rank = self.batch_size * self.sequence_length
+        self.distributed_step_tokens = tokens_per_rank * self.num_processes
+
+        # How many complete distributed steps fit in this shard
+        # (-1 because we need T+1 tokens to produce an (input, target) pair)
+        usable_tokens = len(self.tokens) - 1
+        self.steps_in_shard = usable_tokens // self.distributed_step_tokens
+
+    # ------------------------------------------------------------------
+    # Batch generation
+    # ------------------------------------------------------------------
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return the next (inputs, targets) batch.
+
+        targets already has IGNORE_INDEX (-100) at every position the model
+        should not learn: USER-turn tokens and PAD tokens.
+        """
         B, T = self.batch_size, self.sequence_length
 
-        # CHANGED:
-        # Instead of checking independently whether the current position
-        # is beyond the shard, use the same step count for every rank.
         if self.current_step >= self.steps_in_shard:
             self._advance_to_next_shard()
 
-        # T + 1 tokens are required to create input and target.
-        tokens_needed = B * T + 1
+        start = self.current_position
+        end   = start + B * T + 1
 
-        start_pos = self.current_position
-        end_pos = start_pos + tokens_needed
+        token_seq = self.tokens[start:end]
+        mask_seq  = self.loss_mask[start:end]
 
-        token_sequence = self.tokens[start_pos:end_pos]
+        # input  = first B*T tokens
+        # target = next  B*T tokens (shifted right by 1)
+        inputs      = token_seq[:-1].view(B, T)
+        targets     = token_seq[1:].view(B, T).clone()
+        target_mask = mask_seq[1:].view(B, T)   # mask also shifted to align with targets
 
-        input_tokens = token_sequence[:-1]
-        target_tokens = token_sequence[1:]
+        # Zero-out positions the model should not learn
+        targets[~target_mask] = IGNORE_INDEX
 
-        inputs = input_tokens.view(B, T)
-        targets = target_tokens.view(B, T)
-
-        # CHANGED:
-        # Move to the next distributed batch.
-        # Every rank advances by the total amount consumed by all ranks.
-        self.current_position += (
-            B * T * self.num_processes
-        )
-
-        # CHANGED:
-        self.current_step += 1
+        self.current_position += B * T * self.num_processes
+        self.current_step     += 1
 
         return inputs, targets
 
     def _advance_to_next_shard(self):
-        self.current_shard_idx = (
-            self.current_shard_idx + 1
-        ) % len(self.shard_files)
+        """Move to the next shard, wrapping around after the last one."""
+        self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
+        self._load_shard(self.current_shard_idx)
 
-        shard_path = self.shard_files[self.current_shard_idx]
-        self.tokens = load_shard_tokens(shard_path)
-
-        # CHANGED:
-        # Recalculate how many complete distributed steps
-        # are available in the new shard.
-        usable_tokens = len(self.tokens) - 1
-
-        self.steps_in_shard = (
-            usable_tokens // self.distributed_step_tokens
-        )
-
-        # CHANGED:
-        # Reset the step counter for the new shard.
+        tokens_per_rank = self.batch_size * self.sequence_length
+        self.current_position = tokens_per_rank * self.process_rank
         self.current_step = 0
 
-        # CHANGED:
-        # Every rank starts at its own section of the first
-        # distributed batch in the new shard.
-        tokens_per_batch = self.batch_size * self.sequence_length
-
-        self.current_position = (
-            tokens_per_batch * self.process_rank
-        )
-
-        print(
-            f"Advanced to shard {self.current_shard_idx}, "
-            f"position {self.current_position}, "
-            f"steps_in_shard {self.steps_in_shard}"
-        )
-
-
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
 
     def get_stats(self) -> dict:
-        """
-        Get statistics about the loaded data.
-        
-        Returns:
-            Dictionary containing data statistics
-        """
+        """Return basic statistics about the dataset (loads all shards)."""
         total_tokens = 0
         shard_info = []
-        
         for shard_path in self.shard_files:
             tokens = load_shard_tokens(shard_path)
-            num_tokens = len(tokens)
-            total_tokens += num_tokens
-            
+            total_tokens += len(tokens)
             shard_info.append({
                 'filename': os.path.basename(shard_path),
-                'tokens': num_tokens
+                'tokens': len(tokens),
             })
-        
         return {
             'split': self.split,
             'num_shards': len(self.shard_files),
             'total_tokens': total_tokens,
+            'avg_tokens_per_shard': total_tokens / len(self.shard_files),
             'shard_info': shard_info,
-            'avg_tokens_per_shard': total_tokens / len(self.shard_files) if self.shard_files else 0
         }
 
 
+# ---------------------------------------------------------------------------
+# Quick smoke-test  (python dataloader.py)
+# ---------------------------------------------------------------------------
 
-class ConversationDataLoader_old:
-    """
-    Simple dataloader for conversation training data stored in shards.
-    
-    This dataloader:
-    - Loads tokenized data from .npy shard files
-    - Provides batches for training with configurable batch size and sequence length
-    - Handles multiple processes for distributed training
-    - Cycles through all available shards
-    - Returns input and target sequences (shifted by one token)
-    
-    Args:
-        batch_size (B): Number of sequences per batch
-        sequence_length (T): Length of each sequence (context window)
-        process_rank: Current process rank (for distributed training)
-        num_processes: Total number of processes (for distributed training)
-        split: Data split to use ('train' or 'val')
-        data_root: Root directory containing shard folders (default: 'shards')
-    """
-    
-    def __init__(
-        self, 
-        batch_size: int,
-        sequence_length: int, 
-        process_rank: int = 0,
-        num_processes: int = 1,
-        split: str = 'train',
-        data_root: str = 'shards'
-    ):
-        self.batch_size = batch_size
-        self.sequence_length = sequence_length
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        
-        # Validate split
-        assert split in {'train', 'val'}, f"Split must be 'train' or 'val', got '{split}'"
-        self.split = split
-        
-        # Build path to shard directory
-        shard_dir = os.path.join(data_root, split)
-        
-        # Find all shard files for this split
-        if not os.path.exists(shard_dir):
-            raise ValueError(f"Shard directory does not exist: {shard_dir}")
-            
-        all_files = os.listdir(shard_dir)
-        shard_files = [f for f in all_files if f.startswith(split) and f.endswith('.npy')]
-        shard_files = sorted(shard_files)  # Ensure consistent ordering
-        
-        if not shard_files:
-            raise ValueError(f"No shard files found in {shard_dir} for split '{split}'")
-            
-        # Convert to full paths
-        self.shard_files = [os.path.join(shard_dir, f) for f in shard_files]
-        
-        print(f"DataLoader initialized:")
-        print(f"  Split: {split}")
-        print(f"  Batch size: {batch_size}")
-        print(f"  Sequence length: {sequence_length}")
-        print(f"  Found {len(self.shard_files)} shard files")
-        print(f"  Process {process_rank}/{num_processes}")
-        
-        # Initialize state
-        self.reset()
-    
-    def reset(self):
-        """
-        Reset the dataloader to the beginning.
-        
-        This loads the first shard and sets the position for this process.
-        Each process starts at a different position to avoid data overlap.
-        """
-        # Start with the first shard
-        self.current_shard_idx = 0
-        self.tokens = load_shard_tokens(self.shard_files[self.current_shard_idx])
-        
-        # Each process starts at its own position to avoid overlap
-        # This ensures each process gets different data
-        tokens_per_batch = self.batch_size * self.sequence_length
-        self.current_position = tokens_per_batch * self.process_rank
-        
-        print(f"Reset to shard 0, position {self.current_position}")
-    
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get the next batch of training data.
-        
-        Returns:
-            tuple: (input_sequences, target_sequences)
-                - input_sequences: [batch_size, sequence_length] tensor
-                - target_sequences: [batch_size, sequence_length] tensor (shifted by 1)
-        """
-        B, T = self.batch_size, self.sequence_length
-        
-        # We need T+1 consecutive tokens to create input and target sequences
-        tokens_needed = B * T + 1
-        
-        # Check if we have enough tokens in the current shard
-        if self.current_position + tokens_needed > len(self.tokens):
-            # Need to move to the next shard
-            self._advance_to_next_shard()
-        
-        # Extract the token sequence for this batch
-        start_pos = self.current_position
-        end_pos = start_pos + tokens_needed
-        token_sequence = self.tokens[start_pos:end_pos]
-        
-        # Split into inputs (first T tokens) and targets (last T tokens, shifted by 1)
-        input_tokens = token_sequence[:-1]  # All but last token
-        target_tokens = token_sequence[1:]  # All but first token
-        
-        # Reshape into batch format [batch_size, sequence_length]
-        inputs = input_tokens.view(B, T)
-        targets = target_tokens.view(B, T)
-        
-        # Advance position for next batch
-        # Skip ahead by num_processes to avoid overlap between processes
-        self.current_position += B * T * self.num_processes
-        
-        return inputs, targets
-    
-    def _advance_to_next_shard(self):
-        """
-        Move to the next shard file and reset position.
-        
-        If we're at the last shard, cycle back to the first shard.
-        This allows for infinite training iterations.
-        """
-        # Move to next shard (with wraparound)
-        self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
-        
-        # Load the new shard
-        shard_path = self.shard_files[self.current_shard_idx]
-        self.tokens = load_shard_tokens(shard_path)
-        
-        # Reset position for this process
-        tokens_per_batch = self.batch_size * self.sequence_length
-        self.current_position = tokens_per_batch * self.process_rank
-        
-        shard_filename = os.path.basename(shard_path)
-        print(f"Advanced to shard {self.current_shard_idx}: {shard_filename}")
-        print(f"  Shard size: {len(self.tokens):,} tokens")
-        print(f"  Reset position to: {self.current_position}")
-    
-    def get_stats(self) -> dict:
-        """
-        Get statistics about the loaded data.
-        
-        Returns:
-            Dictionary containing data statistics
-        """
-        total_tokens = 0
-        shard_info = []
-        
-        for shard_path in self.shard_files:
-            tokens = load_shard_tokens(shard_path)
-            num_tokens = len(tokens)
-            total_tokens += num_tokens
-            
-            shard_info.append({
-                'filename': os.path.basename(shard_path),
-                'tokens': num_tokens
-            })
-        
-        return {
-            'split': self.split,
-            'num_shards': len(self.shard_files),
-            'total_tokens': total_tokens,
-            'shard_info': shard_info,
-            'avg_tokens_per_shard': total_tokens / len(self.shard_files) if self.shard_files else 0
-        }
-
-
-# Example usage and testing
 if __name__ == "__main__":
-    print("ConversationDataLoader Test")
+    print("ConversationDataLoader smoke test")
     print("=" * 50)
-    
+
     try:
-        # Try to create a dataloader
-        # Note: This will only work if shards have been created
-        dataloader = ConversationDataLoader(
+        loader = ConversationDataLoader(
             batch_size=2,
             sequence_length=128,
             process_rank=0,
             num_processes=1,
-            split='train'
+            split='train',
         )
-        
-        # Print statistics
-        stats = dataloader.get_stats()
-        print(f"\nDataLoader Statistics:")
-        print(f"  Split: {stats['split']}")
-        print(f"  Number of shards: {stats['num_shards']}")
-        print(f"  Total tokens: {stats['total_tokens']:,}")
-        print(f"  Average tokens per shard: {stats['avg_tokens_per_shard']:.0f}")
-        
-        # Get a sample batch
-        print(f"\nTesting batch generation...")
-        inputs, targets = dataloader.next_batch()
-        print(f"  Input batch shape: {inputs.shape}")
-        print(f"  Target batch shape: {targets.shape}")
-        print(f"  Sample input tokens (first 10): {inputs[0][:10].tolist()}")
-        print(f"  Sample target tokens (first 10): {targets[0][:10].tolist()}")
-        
-        # Test decoding a few tokens to see if they make sense
-        sample_tokens = inputs[0][:20].tolist()
-        try:
-            decoded_text = enc.decode(sample_tokens)
-            print(f"  Decoded sample: '{decoded_text[:100]}...'")
-        except Exception as e:
-            print(f"  Could not decode sample: {e}")
-            
+
+        stats = loader.get_stats()
+        print(f"Split        : {stats['split']}")
+        print(f"Shards       : {stats['num_shards']}")
+        print(f"Total tokens : {stats['total_tokens']:,}")
+
+        inputs, targets = loader.next_batch()
+        print(f"\nInput shape  : {inputs.shape}")
+        print(f"Target shape : {targets.shape}")
+
+        n_masked   = (targets == IGNORE_INDEX).sum().item()
+        n_unmasked = (targets != IGNORE_INDEX).sum().item()
+        print(f"Masked positions  (USER/PAD) : {n_masked}")
+        print(f"Unmasked positions (ASST)    : {n_unmasked}")
+
+        sample = inputs[0, :20].tolist()
+        print(f"\nFirst 20 input tokens : {sample}")
+        print(f"Decoded               : {enc.decode(sample, errors='replace')!r}")
+
     except Exception as e:
-        print(f"Cannot test dataloader: {e}")
-        print("To test the dataloader, first run the data preparation pipeline to create shards.")
+        print(f"Test failed: {e}")
+        print("Run the data preparation pipeline first to create shards.")
