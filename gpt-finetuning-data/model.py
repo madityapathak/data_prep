@@ -16,6 +16,7 @@ from torch.nn import functional as F
 # n_embd (embedding dimension): The size of each token’s vector representation and the width of the model’s hidden layers. For GPT-2 Small, it is 768.
 # block_size (context length): The maximum number of tokens the model can process in one sequence. For GPT-2, it is 1024 tokens.
 # So, n_embd = 768 is the width of each token representation, while block_size = 1024 is how many tokens can fit in one input sequence. They are independent dimensions.
+# get_most_likely_row we need to add this function in the sampling logic this is not used in training but it is used for sampling tokens
 
 
 
