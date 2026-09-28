@@ -72,7 +72,7 @@ class DataPreparationPipeline:
             "dailydialog": DailyDialogProcessor(),
             "dolly": DollyProcessor(),
             "oasst": OASSTProcessor(),
-            "openorca": OpenOrcaProcessor(),
+            # "openorca": OpenOrcaProcessor(),
             "ultrachat": UltraChatProcessor(),
             "static": StaticConversationsProcessor(),
         }
