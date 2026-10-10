@@ -48,7 +48,7 @@ def mprint(*args, **kwargs):
 # 2. Variables & Parameters
 # =============================================================================
 device          = get_device()
-backend         = 'gloo' # 'nccl', 'gloo', etc.
+backend         = 'nccl' # 'nccl', 'gloo', etc.
 
 out_dir = 'out'
 eval_interval = 2000
@@ -123,7 +123,6 @@ else:
     ddp_world_size      = 1
     ddp_rank            = 0
     ddp_local_rank      = 0
-    ddp_world_size      = 1
 
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 mprint(f"tokens per iteration will be: {tokens_per_iter:,}")

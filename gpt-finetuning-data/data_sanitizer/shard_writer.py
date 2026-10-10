@@ -2,7 +2,7 @@
 ShardWriter
 ===========
 Writes already-tokenised, validated conversation sequences into fixed-size
-NumPy shards using the FineWeb-style approach.
+raw binary shards (.bin) for zero-copy memory-mapped loading.
 
 Design decisions
 ----------------
@@ -30,7 +30,8 @@ See verify_shard_integrity() for a post-hoc check.
 Storage format
 --------------
 - dtype : np.uint16  (vocab size of custom gpt2_custom encoder ≤ 65 535)
-- naming: {split}_{index:06d}.npy   e.g.  train_000000.npy
+- naming: {split}_{index:06d}.bin   e.g.  train_000000.bin
+- layout: raw bytes, no header — directly usable with np.memmap
 - the final shard may be shorter than SHARD_SIZE — no zero-padding is added.
 
 Usage
@@ -71,16 +72,16 @@ _MAX_UINT16: int = 2 ** 16  # exclusive upper bound for the assertion
 # ---------------------------------------------------------------------------
 class ShardWriter:
     """
-    Encodes validated packed conversation strings and writes NumPy shards.
+    Encodes validated packed conversation strings and writes raw binary shards.
 
     Parameters
     ----------
     output_dir : str
-        Directory where .npy shard files will be written.  Created if absent.
+        Directory where .bin shard files will be written.  Created if absent.
     split : str
         Logical split name used as the filename prefix, e.g. "train" or "val".
     shard_size : int
-        Maximum number of tokens per shard.  Defaults to SHARD_SIZE (2^25).
+        Maximum number of tokens per shard.  Defaults to SHARD_SIZE (2^26).
     """
 
     def __init__(
@@ -196,7 +197,9 @@ class ShardWriter:
 
         # ---- Summary -----------------------------------------------------
         total_shards      = len(shard_paths)
-        total_shard_tokens = sum(np.load(p).size for p in shard_paths)
+        total_shard_tokens = sum(
+            os.path.getsize(p) // np.dtype(np.uint16).itemsize for p in shard_paths
+        )
 
         print(f"\n  [ShardWriter] ── Summary ──────────────────────────────────────────")
         print(f"  [ShardWriter]   Shards written       : {total_shards}")
@@ -238,7 +241,7 @@ class ShardWriter:
         # Count tokens across all shards on disk
         shard_files = sorted(
             f for f in os.listdir(self.output_dir)
-            if f.startswith(self.split) and f.endswith(".npy")
+            if f.startswith(self.split) and f.endswith(".bin")
         )
 
         if not shard_files:
@@ -248,9 +251,9 @@ class ShardWriter:
         shard_token_count = 0
         for fname in shard_files:
             path = os.path.join(self.output_dir, fname)
-            arr  = np.load(path)
-            shard_token_count += arr.size
-            print(f"    {fname}: {arr.size:,} tokens")
+            n_tokens = os.path.getsize(path) // np.dtype(np.uint16).itemsize
+            shard_token_count += n_tokens
+            print(f"    {fname}: {n_tokens:,} tokens")
 
         print(f"\n  [ShardWriter]   Input tokens : {input_token_count:,}")
         print(f"  [ShardWriter]   Shard tokens : {shard_token_count:,}")
@@ -276,9 +279,13 @@ class ShardWriter:
         return self._write_shard(buffer[:token_count].copy(), shard_index)
 
     def _write_shard(self, tokens: np.ndarray, shard_index: int) -> str:
-        """Persist a uint16 token array to a .npy file and return the path."""
-        filename = f"{self.split}_{shard_index:06d}.npy"
+        """Persist a uint16 token array to a raw .bin file and return the path."""
+        filename = f"{self.split}_{shard_index:06d}.bin"
         path = os.path.join(self.output_dir, filename)
-        np.save(path, tokens)
+
+        # Ensure consistent dtype and contiguous memory
+        tokens = np.ascontiguousarray(tokens, dtype=np.uint16)
+
+        tokens.tofile(path)
         print(f"\r  [ShardWriter] Saved {filename}  ({tokens.size:,} tokens)", end="")
         return path
