@@ -348,6 +348,34 @@ class DataPreparationPipeline:
         print("\nWriting validation shards...")
         val_writer = ShardWriter(output_dir=val_shard_dir, split="val")
         val_writer.write(packed_validation)
+        
+        # Count assistant tokens in both splits
+        print("\n" + "=" * 60)
+        print("ASSISTANT TOKEN STATISTICS")
+        print("=" * 60)
+        
+        train_stats = train_writer.count_assistant_tokens_in_shards()
+        print(f"\n  Training Split:")
+        print(f"    Total tokens:              {train_stats['total_tokens']:,}")
+        print(f"    Assistant response tokens: {train_stats['total_assistant_tokens']:,}")
+        print(f"    Assistant percentage:      {train_stats['assistant_percentage']:.2f}%")
+        
+        val_stats = val_writer.count_assistant_tokens_in_shards()
+        print(f"\n  Validation Split:")
+        print(f"    Total tokens:              {val_stats['total_tokens']:,}")
+        print(f"    Assistant response tokens: {val_stats['total_assistant_tokens']:,}")
+        print(f"    Assistant percentage:      {val_stats['assistant_percentage']:.2f}%")
+        
+        combined_total = train_stats['total_tokens'] + val_stats['total_tokens']
+        combined_assistant = train_stats['total_assistant_tokens'] + val_stats['total_assistant_tokens']
+        combined_percentage = (combined_assistant / combined_total * 100) if combined_total > 0 else 0.0
+        
+        print(f"\n  Combined (Train + Val):")
+        print(f"    Total tokens:              {combined_total:,}")
+        print(f"    Assistant response tokens: {combined_assistant:,}")
+        print(f"    Assistant percentage:      {combined_percentage:.2f}%")
+        
+        print("\n" + "=" * 60)
 
         return packed_train, packed_validation
 

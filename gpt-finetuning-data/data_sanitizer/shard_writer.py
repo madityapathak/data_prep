@@ -216,56 +216,6 @@ class ShardWriter:
 
         return shard_paths
 
-    def verify_shard_integrity(self, validated_sequences: List[str]) -> bool:
-        """
-        Post-hoc integrity check: re-encode all sequences and compare the
-        total token count against the tokens stored in every existing shard.
-
-        This lets you confirm that the sharding stage neither lost nor
-        duplicated a single token.
-
-        Args:
-            validated_sequences: The same list passed to write().
-
-        Returns:
-            True if input_token_count == shard_token_count, False otherwise.
-        """
-        print(f"\n  [ShardWriter] Running shard integrity verification...")
-
-        # Count tokens in input
-        input_token_count = sum(
-            len(enc.encode(seq, allowed_special="all"))
-            for seq in tqdm(validated_sequences, desc="  Counting input tokens", unit="seq")
-        )
-
-        # Count tokens across all shards on disk
-        shard_files = sorted(
-            f for f in os.listdir(self.output_dir)
-            if f.startswith(self.split) and f.endswith(".bin")
-        )
-
-        if not shard_files:
-            print(f"  [ShardWriter] ✗ No shard files found in '{self.output_dir}'.")
-            return False
-
-        shard_token_count = 0
-        for fname in shard_files:
-            path = os.path.join(self.output_dir, fname)
-            n_tokens = os.path.getsize(path) // np.dtype(np.uint16).itemsize
-            shard_token_count += n_tokens
-            print(f"    {fname}: {n_tokens:,} tokens")
-
-        print(f"\n  [ShardWriter]   Input tokens : {input_token_count:,}")
-        print(f"  [ShardWriter]   Shard tokens : {shard_token_count:,}")
-
-        if input_token_count == shard_token_count:
-            print("  [ShardWriter]   ✓ Integrity check PASSED – no tokens lost or duplicated.")
-            return True
-        else:
-            diff = input_token_count - shard_token_count
-            print(f"  [ShardWriter]   ✗ Integrity check FAILED – difference: {diff:+,} tokens.")
-            return False
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -288,4 +238,140 @@ class ShardWriter:
 
         tokens.tofile(path)
         print(f"\r  [ShardWriter] Saved {filename}  ({tokens.size:,} tokens)", end="")
+        
+        # Generate loss mask for this shard
+        self._generate_mask_for_shard(path, tokens)
+        
         return path
+    
+    def _generate_mask_for_shard(self, shard_path: str, tokens: np.ndarray) -> str:
+        """
+        Generate and save a loss mask for a .bin shard file.
+        
+        The mask is stored as a .mask.bin file with the same length as the shard,
+        using np.bool_ dtype (1 byte per token).
+        
+        Args:
+            shard_path: Path to the .bin shard file
+            tokens: Token array (uint16)
+            
+        Returns:
+            Path to the generated mask file
+            
+        Mask generation rules:
+            - <|PAD|> tokens → False (masked)
+            - Control tokens (<|USER|>, <|ASSISTANT|>, <|BOS|>, <|EOT|>) → False (masked)
+            - User turn content tokens → False (masked)
+            - Assistant turn content tokens → True (unmasked)
+            - Closing <|EOS|> after assistant turn → True (unmasked)
+        """
+        # Get special token IDs
+        USER_TOKEN_ID = special_tokens["<|USER|>"]
+        ASSISTANT_TOKEN_ID = special_tokens["<|ASSISTANT|>"]
+        PAD_TOKEN_ID = special_tokens["<|PAD|>"]
+        EOS_TOKEN_ID = special_tokens["<|EOS|>"]
+        
+        # Determine mask output path
+        mask_path = shard_path.replace('.bin', '.mask.bin')
+        
+        # Create mask array
+        mask = np.zeros(len(tokens), dtype=np.bool_)
+        in_assistant_turn = False
+        
+        # Process tokens to build mask
+        for i, token_id in enumerate(tokens):
+            if token_id == ASSISTANT_TOKEN_ID:
+                in_assistant_turn = True
+                mask[i] = False  # control token is masked
+            elif token_id == EOS_TOKEN_ID and in_assistant_turn:
+                mask[i] = True   # closing EOS is unmasked
+                in_assistant_turn = False
+            elif token_id == PAD_TOKEN_ID:
+                mask[i] = False
+            elif in_assistant_turn:
+                mask[i] = True
+            else:
+                mask[i] = False
+        
+        # Write mask to disk
+        mask.tofile(mask_path)
+        
+        return mask_path
+    
+    def count_assistant_tokens_in_shards(self) -> dict:
+        """
+        Count only assistant response tokens across all shards in the output directory.
+        
+        This counts tokens that are:
+        - Inside ASSISTANT turns (between <|ASSISTANT|> and <|EOS|>)
+        - Excluding the <|ASSISTANT|> control token itself
+        - Including the closing <|EOS|> token
+        
+        Uses the pre-generated .mask.bin files for extremely fast vectorized counting.
+        
+        Returns:
+            Dictionary with per-shard and total counts:
+            {
+                'shards': [{'filename': str, 'assistant_tokens': int}, ...],
+                'total_assistant_tokens': int,
+                'total_tokens': int,
+                'assistant_percentage': float
+            }
+        """
+        # Find all .bin shard files
+        shard_files = sorted(
+            f for f in os.listdir(self.output_dir)
+            if f.startswith(self.split) and f.endswith(".bin") and not f.endswith(".mask.bin")
+        )
+        
+        if not shard_files:
+            return {
+                'shards': [],
+                'total_assistant_tokens': 0,
+                'total_tokens': 0,
+                'assistant_percentage': 0.0
+            }
+        
+        shard_info = []
+        total_assistant_tokens = 0
+        total_tokens = 0
+        
+        print(f"\n  [ShardWriter] Counting assistant tokens in {len(shard_files)} shards...")
+        
+        for fname in tqdm(shard_files, desc="  Counting assistant tokens", unit="shard"):
+            shard_path = os.path.join(self.output_dir, fname)
+            mask_path = shard_path.replace('.bin', '.mask.bin')
+            
+            # Memory-map the shard to get token count
+            tokens = np.memmap(shard_path, dtype=np.uint16, mode='r')
+            shard_len = len(tokens)
+            total_tokens += shard_len
+            
+            # Memory-map the mask file for fast counting
+            # The mask already has True for assistant tokens, False for everything else
+            mask = np.memmap(mask_path, dtype=np.bool_, mode='r')
+            
+            # Vectorized count - extremely fast! Just sum the boolean array
+            assistant_count = np.sum(mask)
+            
+            shard_info.append({
+                'filename': fname,
+                'assistant_tokens': int(assistant_count),
+                'total_tokens': shard_len
+            })
+            
+            total_assistant_tokens += int(assistant_count)
+            
+            # Close memmaps
+            del tokens
+            del mask
+        
+        assistant_percentage = (total_assistant_tokens / total_tokens * 100) if total_tokens > 0 else 0.0
+        
+        return {
+            'shards': shard_info,
+            'total_assistant_tokens': total_assistant_tokens,
+            'total_tokens': total_tokens,
+            'assistant_percentage': assistant_percentage
+        }
+

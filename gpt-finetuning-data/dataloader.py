@@ -13,6 +13,9 @@ so the model only trains to predict ASSISTANT responses.
 
 Token format inside each shard sequence:
     <|BOS|> <|USER|> ... <|EOS|> <|ASSISTANT|> ... <|EOS|> ... <|EOT|> <|PAD|>...
+    
+Loss masks are stored as .mask.bin files alongside token shards and are
+memory-mapped for efficient loading.
 """
 
 import os
@@ -31,56 +34,6 @@ EOS_TOKEN_ID       = special_tokens["<|EOS|>"]
 EOT_TOKEN_ID       = special_tokens["<|EOT|>"]
 
 IGNORE_INDEX = -100   # value used by cross_entropy to skip a position
-
-
-# ---------------------------------------------------------------------------
-# Shard loading
-# ---------------------------------------------------------------------------
-
-def load_shard_tokens(filename: str) -> torch.Tensor:
-    """
-    Load a .npy shard (uint16) and return a torch.long tensor of token IDs.
-    """
-    token_array = np.load(filename).astype(np.int32)
-    return torch.tensor(token_array, dtype=torch.long)
-
-
-# ---------------------------------------------------------------------------
-# Loss-mask builder
-# ---------------------------------------------------------------------------
-
-def build_loss_mask(token_sequence: torch.Tensor) -> torch.Tensor:
-    """
-    Given a flat 1-D token sequence, return a boolean mask of the same length
-    where True means "this position should contribute to the loss".
-
-    Rules:
-        - <|PAD|> tokens are always masked (False).
-        - Control tokens (<|USER|>, <|ASSISTANT|>, <|BOS|>, <|EOT|>) are masked.
-        - Content tokens inside a USER turn are masked (False).
-        - Content tokens inside an ASSISTANT turn, including the closing <|EOS|>,
-          are unmasked (True).
-
-    The sequence is scanned left-to-right. We start in 'masked' mode and
-    flip to 'unmasked' after each <|ASSISTANT|> token, then back to 'masked'
-    after each <|EOS|> that closes an ASSISTANT turn.
-    """
-    mask = torch.zeros(len(token_sequence), dtype=torch.bool)
-    in_assistant_turn = False
-
-    for i, token_id in enumerate(token_sequence.tolist()):
-        if token_id == ASSISTANT_TOKEN_ID:
-            in_assistant_turn = True
-            mask[i] = False          # the control token itself is not a target
-        elif token_id == EOS_TOKEN_ID and in_assistant_turn:
-            mask[i] = True           # include the closing <|EOS|> in the loss
-            in_assistant_turn = False
-        elif token_id == PAD_TOKEN_ID:
-            mask[i] = False
-        elif in_assistant_turn:
-            mask[i] = True
-
-    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -127,19 +80,81 @@ class ConversationDataLoader:
         if not os.path.exists(shard_dir):
             raise ValueError(f"Shard directory does not exist: {shard_dir}")
 
+        # Look for .bin files (not .mask.bin)
         shard_files = sorted(
             f for f in os.listdir(shard_dir)
-            if f.startswith(split) and f.endswith('.npy')
+            if f.startswith(split) and f.endswith('.bin') and not f.endswith('.mask.bin')
         )
         if not shard_files:
-            raise ValueError(f"No shard files found in {shard_dir} for split '{split}'")
+            raise ValueError(f"No .bin shard files found in {shard_dir} for split '{split}'")
 
         self.shard_files = [os.path.join(shard_dir, f) for f in shard_files]
+
+        # Active memory-map references
+        self.tokens = None
+        self.loss_mask = None
+        
+        # Verify that all mask files exist and lengths match shards
+        self._verify_mask_files()
+        
         self.reset()
 
     # ------------------------------------------------------------------
-    # State management
+    # State management & resource cleanup
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _close_memmap(arr):
+        """Explicitly close the underlying mmap buffer to release OS file descriptors."""
+        if arr is not None and hasattr(arr, '_mmap') and arr._mmap is not None:
+            try:
+                arr._mmap.close()
+            except Exception:
+                pass
+
+    def _close_current_shard(self):
+        """Explicitly close the current shard and mask memmap buffers."""
+        if hasattr(self, 'tokens') and self.tokens is not None:
+            self._close_memmap(self.tokens)
+            self.tokens = None
+        if hasattr(self, 'loss_mask') and self.loss_mask is not None:
+            self._close_memmap(self.loss_mask)
+            self.loss_mask = None
+
+    def close(self):
+        """Explicitly release all memory-mapped file handles."""
+        self._close_current_shard()
+
+    def __del__(self):
+        self.close()
+    
+    def _verify_mask_files(self):
+        """Verify that all mask files exist and their token counts match the shard files."""
+        for shard_path in self.shard_files:
+            mask_path = shard_path.replace('.bin', '.mask.bin')
+            if not os.path.exists(mask_path):
+                raise FileNotFoundError(
+                    f"Mask file not found: {mask_path}\n"
+                    f"Run the data preparation pipeline to generate masks."
+                )
+
+            shard_bytes = os.path.getsize(shard_path)
+            mask_bytes = os.path.getsize(mask_path)
+
+            if shard_bytes % 2 != 0:
+                raise ValueError(
+                    f"Corrupted shard file (odd byte count {shard_bytes}): {os.path.basename(shard_path)}"
+                )
+
+            token_count = shard_bytes // 2
+            mask_count = mask_bytes
+
+            if token_count != mask_count:
+                raise ValueError(
+                    f"Shard and mask length mismatch in {os.path.basename(shard_path)}: "
+                    f"{token_count:,} tokens vs {mask_count:,} mask values. "
+                    f"Regenerate masks or re-run the pipeline."
+                )
 
     def reset(self):
         """Reset to the beginning of the first shard."""
@@ -151,12 +166,25 @@ class ConversationDataLoader:
         self.current_step = 0
 
     def _load_shard(self, idx: int):
-        """Load the shard at index idx and pre-build its loss mask."""
-        shard_path = self.shard_files[idx]
-        self.tokens = load_shard_tokens(shard_path)
+        """Load the shard at index idx using memory mapping."""
+        # Release the previous shard's OS file descriptors before opening new ones
+        self._close_current_shard()
 
-        # Pre-build the loss mask for the whole shard in one pass
-        self.loss_mask = build_loss_mask(self.tokens)
+        shard_path = self.shard_files[idx]
+        mask_path = shard_path.replace('.bin', '.mask.bin')
+        
+        # Memory-map the token shard (do not load into RAM)
+        self.tokens = np.memmap(shard_path, dtype=np.uint16, mode='r')
+        
+        # Memory-map the loss mask
+        self.loss_mask = np.memmap(mask_path, dtype=np.bool_, mode='r')
+        
+        # Defensive check
+        if len(self.tokens) != len(self.loss_mask):
+            raise ValueError(
+                f"Shard and mask length mismatch in {os.path.basename(shard_path)}: "
+                f"{len(self.tokens)} tokens vs {len(self.loss_mask)} mask values"
+            )
 
         tokens_per_rank = self.batch_size * self.sequence_length
         self.distributed_step_tokens = tokens_per_rank * self.num_processes
@@ -185,14 +213,20 @@ class ConversationDataLoader:
         start = self.current_position
         end   = start + B * T + 1
 
+        # Extract slices from memory-mapped arrays (minimal memory footprint)
         token_seq = self.tokens[start:end]
         mask_seq  = self.loss_mask[start:end]
+        
+        # Convert to torch tensors only for the batch
+        token_tensor = torch.from_numpy(token_seq.astype(np.int32))
+
+        mask_tensor = torch.from_numpy(mask_seq.copy())
 
         # input  = first B*T tokens
         # target = next  B*T tokens (shifted right by 1)
-        inputs      = token_seq[:-1].view(B, T)
-        targets     = token_seq[1:].view(B, T).clone()
-        target_mask = mask_seq[1:].view(B, T)   # mask also shifted to align with targets
+        inputs      = token_tensor[:-1].view(B, T)
+        targets     = token_tensor[1:].view(B, T).clone()
+        target_mask = mask_tensor[1:].view(B, T)   # mask also shifted to align with targets
 
         # Zero-out positions the model should not learn
         targets[~target_mask] = IGNORE_INDEX
@@ -216,16 +250,20 @@ class ConversationDataLoader:
     # ------------------------------------------------------------------
 
     def get_stats(self) -> dict:
-        """Return basic statistics about the dataset (loads all shards)."""
+        """Return basic statistics about the dataset (uses memory mapping, minimal RAM)."""
         total_tokens = 0
         shard_info = []
         for shard_path in self.shard_files:
-            tokens = load_shard_tokens(shard_path)
-            total_tokens += len(tokens)
+            # Memory-map instead of loading
+            tokens = np.memmap(shard_path, dtype=np.uint16, mode='r')
+            shard_tokens = len(tokens)
+            total_tokens += shard_tokens
             shard_info.append({
                 'filename': os.path.basename(shard_path),
-                'tokens': len(tokens),
+                'tokens': shard_tokens,
             })
+            self._close_memmap(tokens)
+            del tokens
         return {
             'split': self.split,
             'num_shards': len(self.shard_files),
@@ -243,6 +281,7 @@ if __name__ == "__main__":
     print("ConversationDataLoader smoke test")
     print("=" * 50)
 
+    loader = None
     try:
         loader = ConversationDataLoader(
             batch_size=2,
@@ -269,7 +308,12 @@ if __name__ == "__main__":
         sample = inputs[0, :20].tolist()
         print(f"\nFirst 20 input tokens : {sample}")
         print(f"Decoded               : {enc.decode(sample, errors='replace')!r}")
+        
+        print("\n✓ Memory-mapped .bin shards and .mask.bin files loaded successfully")
 
     except Exception as e:
         print(f"Test failed: {e}")
-        print("Run the data preparation pipeline first to create shards.")
+        print("Run 'python run_pipeline.py' first to create .bin shards and masks.")
+    finally:
+        if loader is not None:
+            loader.close()
