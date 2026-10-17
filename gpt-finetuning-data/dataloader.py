@@ -2,8 +2,18 @@
 DataLoader for GPT Chat Fine-tuning
 
 Loads tokenised conversation shards (created by ShardWriter) and produces
-(input, target) batches with a loss mask already applied:
+(input, target) batches with a loss mask already applied.
 
+Fine-tuning Semantics
+---------------------
+Each sequence in the shard is a complete packed conversation of exactly T tokens:
+    <|BOS|> <|USER|> ... <|EOS|> <|ASSISTANT|> ... <|EOS|> ... <|EOT|> <|PAD|>...
+
+The dataloader respects sequence boundaries and returns B complete sequences per batch.
+Input/target shifting happens WITHIN each sequence, not across sequences.
+
+Loss Masking
+------------
     - <|USER|> turns   → target = -100  (masked, not learned)
     - <|PAD|> tokens   → target = -100  (masked, not learned)
     - <|ASSISTANT|> turns → target = real token  (learned)
@@ -11,8 +21,11 @@ Loads tokenised conversation shards (created by ShardWriter) and produces
 cross_entropy with ignore_index=-100 will automatically skip masked positions,
 so the model only trains to predict ASSISTANT responses.
 
-Token format inside each shard sequence:
-    <|BOS|> <|USER|> ... <|EOS|> <|ASSISTANT|> ... <|EOS|> ... <|EOT|> <|PAD|>...
+Batch Structure
+---------------
+For batch_size B and sequence_length T:
+    inputs  : (B, T) — B complete packed sequences
+    targets : (B, T) — shifted by 1 position within each sequence
     
 Loss masks are stored as .mask.bin files alongside token shards and are
 memory-mapped for efficient loading.
@@ -161,8 +174,9 @@ class ConversationDataLoader:
         self.current_shard_idx = 0
         self._load_shard(self.current_shard_idx)
 
-        tokens_per_rank = self.batch_size * self.sequence_length
-        self.current_position = tokens_per_rank * self.process_rank
+        # Each rank starts at a different sequence offset
+        sequences_per_rank = self.batch_size
+        self.current_sequence_idx = sequences_per_rank * self.process_rank
         self.current_step = 0
 
     def _load_shard(self, idx: int):
@@ -186,13 +200,23 @@ class ConversationDataLoader:
                 f"{len(self.tokens)} tokens vs {len(self.loss_mask)} mask values"
             )
 
-        tokens_per_rank = self.batch_size * self.sequence_length
-        self.distributed_step_tokens = tokens_per_rank * self.num_processes
+        # Verify shard contains complete sequences
+        shard_tokens = len(self.tokens)
+        if shard_tokens % self.sequence_length != 0:
+            raise ValueError(
+                f"Shard {os.path.basename(shard_path)} contains partial sequence: "
+                f"{shard_tokens} tokens is not a multiple of {self.sequence_length}"
+            )
+
+        # Calculate how many complete sequences are in this shard
+        total_sequences = shard_tokens // self.sequence_length
+        
+        # In distributed training, each process gets a subset of sequences
+        sequences_per_rank = self.batch_size
+        sequences_per_step = sequences_per_rank * self.num_processes
 
         # How many complete distributed steps fit in this shard
-        # (-1 because we need T+1 tokens to produce an (input, target) pair)
-        usable_tokens = len(self.tokens) - 1
-        self.steps_in_shard = usable_tokens // self.distributed_step_tokens
+        self.steps_in_shard = total_sequences // sequences_per_step
 
     # ------------------------------------------------------------------
     # Batch generation
@@ -202,37 +226,52 @@ class ConversationDataLoader:
         """
         Return the next (inputs, targets) batch.
 
+        Returns B complete packed sequences, each of length T.
+        Input/target shifting happens within each sequence.
+        
         targets already has IGNORE_INDEX (-100) at every position the model
         should not learn: USER-turn tokens and PAD tokens.
         """
         B, T = self.batch_size, self.sequence_length
 
         if self.current_step >= self.steps_in_shard:
+            print("shard no : ",self.current_shard_idx)
             self._advance_to_next_shard()
 
-        start = self.current_position
-        end   = start + B * T + 1
+        # Calculate token position for this rank's batch
+        start_token = self.current_sequence_idx * T
+        end_token = start_token + B * T
 
-        # Extract slices from memory-mapped arrays (minimal memory footprint)
-        token_seq = self.tokens[start:end]
-        mask_seq  = self.loss_mask[start:end]
+        # Extract B complete sequences from memory-mapped arrays
+        token_seq = self.tokens[start_token:end_token]
+        mask_seq = self.loss_mask[start_token:end_token]
         
-        # Convert to torch tensors only for the batch
+        # Convert to torch tensors
         token_tensor = torch.from_numpy(token_seq.astype(np.int32))
-
         mask_tensor = torch.from_numpy(mask_seq.copy())
 
-        # input  = first B*T tokens
-        # target = next  B*T tokens (shifted right by 1)
-        inputs      = token_tensor[:-1].view(B, T)
-        targets     = token_tensor[1:].view(B, T).clone()
-        target_mask = mask_tensor[1:].view(B, T)   # mask also shifted to align with targets
+        # Reshape into (B, T) - each row is a complete packed sequence
+        inputs = token_tensor.view(B, T)
+        mask_2d = mask_tensor.view(B, T)
+        
+        # Create targets by shifting within each sequence
+        # targets[b, i] should predict inputs[b, i+1]
+        targets = inputs.clone()
+        targets[:, :-1] = inputs[:, 1:]   # shift left within each sequence
+        targets[:, -1] = PAD_TOKEN_ID     # last position predicts PAD
+        
+        # Shift mask to align with targets
+        target_mask = mask_2d.clone()
+        target_mask[:, :-1] = mask_2d[:, 1:]
+        target_mask[:, -1] = False  # don't learn the final PAD prediction
 
         # Zero-out positions the model should not learn
         targets[~target_mask] = IGNORE_INDEX
 
-        self.current_position += B * T * self.num_processes
-        self.current_step     += 1
+        # Advance to next batch
+        sequences_per_step = self.batch_size * self.num_processes
+        self.current_sequence_idx += sequences_per_step
+        self.current_step += 1
 
         return inputs, targets
 
@@ -241,8 +280,9 @@ class ConversationDataLoader:
         self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
         self._load_shard(self.current_shard_idx)
 
-        tokens_per_rank = self.batch_size * self.sequence_length
-        self.current_position = tokens_per_rank * self.process_rank
+        # Reset to this rank's starting sequence
+        sequences_per_rank = self.batch_size
+        self.current_sequence_idx = sequences_per_rank * self.process_rank
         self.current_step = 0
 
     # ------------------------------------------------------------------

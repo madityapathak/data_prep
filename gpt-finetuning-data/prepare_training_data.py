@@ -17,8 +17,9 @@ Pipeline:
    - Invalid sequences are logged to a file for inspection
 5. Write NumPy shards (ShardWriter):
    - Encode validated strings to uint16 token arrays
-   - Respect conversation boundaries — never split a conversation across shards
-   - Write fixed-size shards (2^25 ≈ 32 M tokens) for efficient DataLoader use
+   - Respect sequence boundaries — each sequence is exactly 1024 tokens
+   - Write fixed-size shards (default: 16 sequences = 16,384 tokens = 32 KB)
+   - Each shard contains complete sequences only (no partial sequences)
 """
 
 import random
@@ -39,7 +40,7 @@ from data_sanitizer.dataset_cleaner import DatasetCleaner
 from data_sanitizer.conversation_filter import ConversationFilter
 from data_sanitizer.conversation_window_processor import ConversationWindowProcessor
 from data_sanitizer.token_packer import TokenPacker
-from data_sanitizer.shard_writer import ShardWriter, SHARD_SIZE
+from data_sanitizer.shard_writer import ShardWriter, DEFAULT_SEQUENCE_LENGTH, DEFAULT_SEQUENCES_PER_SHARD
 from data_sanitizer.utils import num_tokens
 
 
@@ -338,7 +339,9 @@ class DataPreparationPipeline:
         """
         print("\n" + "=" * 60)
         print("STEP 5: Writing NumPy shards")
-        print(f"        Shard size : {SHARD_SIZE:,} tokens (2^25 ≈ 32 M)")
+        print(f"        Sequence length      : {DEFAULT_SEQUENCE_LENGTH:,} tokens")
+        print(f"        Sequences per shard  : {DEFAULT_SEQUENCES_PER_SHARD}")
+        print(f"        Shard size (tokens)  : {DEFAULT_SEQUENCE_LENGTH * DEFAULT_SEQUENCES_PER_SHARD:,}")
         print("=" * 60)
 
         print("\nWriting train shards...")

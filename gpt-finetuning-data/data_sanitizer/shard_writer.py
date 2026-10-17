@@ -4,43 +4,46 @@ ShardWriter
 Writes already-tokenised, validated conversation sequences into fixed-size
 raw binary shards (.bin) for zero-copy memory-mapped loading.
 
-Design decisions
-----------------
-Shard size: 2**25 = 33,554,432 tokens  (~32 M tokens per shard)
-- Power-of-two aligned → friendly for PyTorch DataLoader chunk slicing.
-- At 1 024-token context length: 32,768 complete training windows per shard.
-- ~64 MB on disk per shard (uint16, 2 bytes/token) — easy to memory-map.
-- With ~147 M total tokens → ~4-5 full shards, manageable shard count.
-- 2**26 (~64 M) would give only 2 shards which is too few for shuffling;
-  2**24 (~16 M) gives ~9 shards which is fine but 32 M is the sweet spot.
+Fine-tuning Design
+------------------
+Each input conversation is already packed and padded to exactly SEQUENCE_LENGTH
+tokens (1024 by default). The shard writer respects these sequence boundaries
+and stores complete sequences only.
 
-Conversation-boundary guarantee
---------------------------------
-Each conversation is kept intact within a single shard.  If the next
-conversation would overflow the current shard the current shard is flushed
-first and the conversation starts a new shard.  A single conversation that
-exceeds the shard size is written out as its own oversized shard with a
-warning rather than silently truncated or split.
+Shard size: Configurable via sequences_per_shard (default: 16)
+- Each sequence is exactly 1024 tokens (packed + padded)
+- Default shard = 16 sequences × 1024 tokens = 16,384 tokens = 32 KB
+- Each shard contains a whole number of sequences (no partial sequences)
+- Clean sequence boundaries enable proper fine-tuning semantics
+
+Sequence-boundary guarantee
+----------------------------
+Each packed conversation sequence (1024 tokens) is kept intact within a single
+shard. Sequences are NEVER split across shard boundaries. If adding the next
+sequence would exceed the shard size, the current shard is flushed first.
 
 Token integrity guarantee
 --------------------------
 Every token appears in exactly one shard — no gaps, no duplicates.
-See verify_shard_integrity() for a post-hoc check.
 
 Storage format
 --------------
 - dtype : np.uint16  (vocab size of custom gpt2_custom encoder ≤ 65 535)
 - naming: {split}_{index:06d}.bin   e.g.  train_000000.bin
 - layout: raw bytes, no header — directly usable with np.memmap
-- the final shard may be shorter than SHARD_SIZE — no zero-padding is added.
+- each shard contains an exact multiple of SEQUENCE_LENGTH tokens
 
 Usage
 -----
     from data_sanitizer.shard_writer import ShardWriter
 
-    writer = ShardWriter(output_dir="shards/train", split="train")
+    writer = ShardWriter(
+        output_dir="shards/train",
+        split="train",
+        sequence_length=1024,
+        sequences_per_shard=16
+    )
     writer.write(validated_packed_sequences)
-    writer.verify_shard_integrity(validated_packed_sequences)
 """
 
 from __future__ import annotations
@@ -59,8 +62,11 @@ from data_sanitizer.utils import enc, special_tokens
 # Constants
 # ---------------------------------------------------------------------------
 
-# 2^26 = 67 108 864 tokens ≈ 64 M tokens per shard
-SHARD_SIZE: int = 2 ** 26
+# Default sequence length (each packed conversation is exactly this many tokens)
+DEFAULT_SEQUENCE_LENGTH: int = 1024
+
+# Default sequences per shard (16 sequences × 1024 tokens = 16,384 tokens = 32 KB)
+DEFAULT_SEQUENCES_PER_SHARD: int = 16
 
 # GPT-2 base vocab has 50 257 tokens; our custom encoder adds 6 specials
 # → maximum token ID = 50 262, well within uint16 range (65 535).
@@ -80,19 +86,25 @@ class ShardWriter:
         Directory where .bin shard files will be written.  Created if absent.
     split : str
         Logical split name used as the filename prefix, e.g. "train" or "val".
-    shard_size : int
-        Maximum number of tokens per shard.  Defaults to SHARD_SIZE (2^26).
+    sequence_length : int
+        Length of each packed sequence in tokens.  Defaults to 1024.
+    sequences_per_shard : int
+        Number of complete sequences to store per shard.  Defaults to 16.
+        Shard size in tokens = sequence_length × sequences_per_shard.
     """
 
     def __init__(
         self,
         output_dir: str,
         split: str = "train",
-        shard_size: int = SHARD_SIZE,
+        sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+        sequences_per_shard: int = DEFAULT_SEQUENCES_PER_SHARD,
     ) -> None:
         self.output_dir = output_dir
         self.split      = split
-        self.shard_size = shard_size
+        self.sequence_length = sequence_length
+        self.sequences_per_shard = sequences_per_shard
+        self.shard_size = sequence_length * sequences_per_shard  # in tokens
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -103,22 +115,24 @@ class ShardWriter:
         """
         Encode each sequence and write tokens into shard files.
 
-        Conversation boundaries are respected: a conversation is never split
-        across two shards.  If a single conversation exceeds ``shard_size`` it
-        is written as its own (oversized) shard with a printed warning.
+        Each input sequence is already packed and padded to exactly
+        self.sequence_length tokens (1024 by default). Sequences are
+        grouped into shards containing exactly self.sequences_per_shard
+        complete sequences each. Sequence boundaries are never split.
 
         Args:
-            validated_sequences: Packed, validated conversation strings.
-                                 These must already have passed ConversationValidator.
+            validated_sequences: Packed, padded, validated conversation strings.
+                                 Each must be exactly self.sequence_length tokens.
 
         Returns:
             List of absolute paths to every shard file that was written.
         """
         print(f"\n  [ShardWriter] Encoding and writing shards to '{self.output_dir}'")
-        print(f"  [ShardWriter] Shard size : {self.shard_size:,} tokens (2^{self.shard_size.bit_length() - 1})")
+        print(f"  [ShardWriter] Sequence length        : {self.sequence_length:,} tokens")
+        print(f"  [ShardWriter] Sequences per shard    : {self.sequences_per_shard}")
+        print(f"  [ShardWriter] Shard size (tokens)    : {self.shard_size:,}")
 
-        # ---- Pre-encode every conversation to token IDs ------------------
-        # We do this upfront so that shard decisions are made on actual lengths.
+        # ---- Pre-encode every sequence to token IDs ----------------------
         token_lists: List[np.ndarray] = []
         total_input_tokens = 0
 
@@ -134,83 +148,72 @@ class ShardWriter:
                 f"Vocabulary too large for this storage format."
             )
 
+            # Verify sequence length matches expected
+            seq_len = len(arr)
+            if seq_len != self.sequence_length:
+                raise ValueError(
+                    f"Sequence length mismatch: expected {self.sequence_length}, "
+                    f"got {seq_len}. All sequences must be packed to exactly "
+                    f"{self.sequence_length} tokens."
+                )
+
             token_lists.append(arr.astype(np.uint16))
             total_input_tokens += len(arr)
 
-        print(f"  [ShardWriter] Total tokens to shard : {total_input_tokens:,}")
+        print(f"  [ShardWriter] Total sequences        : {len(token_lists):,}")
+        print(f"  [ShardWriter] Total tokens to shard  : {total_input_tokens:,}")
 
         # ---- Write shards ------------------------------------------------
         shard_paths: List[str] = []
         shard_index = 0
+        
+        # Buffer to accumulate sequences
+        buffer_sequences = []
 
-        # Preallocate a buffer for the current shard
-        buffer = np.empty(self.shard_size, dtype=np.uint16)
-        tokens_in_buffer = 0
+        for conv_tokens in tqdm(token_lists, desc="  Writing shards    ", unit="seq"):
+            buffer_sequences.append(conv_tokens)
 
-        for conv_tokens in tqdm(token_lists, desc="  Writing shards    ", unit="conv"):
-            conv_len = len(conv_tokens)
-
-            # Case 1: conversation is larger than an entire shard.
-            # Flush any buffered tokens first, then write this conversation
-            # as its own oversized shard.
-            if conv_len > self.shard_size:
-                print("[DEBUG] THIS PRINT SHOULD NEVER BE IN TERMINAL AS conv_len > shard_size IS NEVER GOING TO BE TRUE")
-                print(
-                    f"\n  [ShardWriter] ⚠ Oversized conversation: {conv_len:,} tokens "
-                    f"> shard_size {self.shard_size:,}.  Writing as standalone shard."
-                )
-                # Flush current buffer first (if non-empty)
-                if tokens_in_buffer > 0:
-                    path = self._flush_shard(buffer, tokens_in_buffer, shard_index)
-                    shard_paths.append(path)
-                    shard_index += 1
-                    tokens_in_buffer = 0
-
-                # Write oversized conversation as its own shard
-                oversized_arr = conv_tokens  # already np.uint16
-                path = self._write_shard(oversized_arr, shard_index)
+            # When buffer reaches target size, flush to disk
+            if len(buffer_sequences) >= self.sequences_per_shard:
+                # Concatenate all sequences in buffer
+                shard_data = np.concatenate(buffer_sequences)
+                path = self._write_shard(shard_data, shard_index)
                 shard_paths.append(path)
                 shard_index += 1
-                continue
-
-            # Case 2: conversation fits in the current buffer.
-            if tokens_in_buffer + conv_len <= self.shard_size:
-                buffer[tokens_in_buffer : tokens_in_buffer + conv_len] = conv_tokens
-                tokens_in_buffer += conv_len
-
-            # Case 3: conversation does NOT fit in the remaining buffer space.
-            # Flush current buffer first, then start a fresh shard.
-            else:
-                path = self._flush_shard(buffer, tokens_in_buffer, shard_index)
-                shard_paths.append(path)
-                shard_index += 1
-
-                # Start a new buffer with this conversation
-                tokens_in_buffer = 0
-                buffer[tokens_in_buffer : tokens_in_buffer + conv_len] = conv_tokens
-                tokens_in_buffer += conv_len
+                buffer_sequences = []
 
         # ---- Write the final (possibly partial) shard --------------------
-        if tokens_in_buffer > 0:
-            path = self._flush_shard(buffer, tokens_in_buffer, shard_index)
+        if buffer_sequences:
+            shard_data = np.concatenate(buffer_sequences)
+            path = self._write_shard(shard_data, shard_index)
             shard_paths.append(path)
 
         # ---- Summary -----------------------------------------------------
-        total_shards      = len(shard_paths)
+        total_shards = len(shard_paths)
         total_shard_tokens = sum(
             os.path.getsize(p) // np.dtype(np.uint16).itemsize for p in shard_paths
         )
 
         print(f"\n  [ShardWriter] ── Summary ──────────────────────────────────────────")
         print(f"  [ShardWriter]   Shards written       : {total_shards}")
+        print(f"  [ShardWriter]   Input sequences      : {len(token_lists):,}")
         print(f"  [ShardWriter]   Input tokens         : {total_input_tokens:,}")
         print(f"  [ShardWriter]   Tokens in shards     : {total_shard_tokens:,}")
+        print(f"  [ShardWriter]   Sequences per shard  : {self.sequences_per_shard}")
+        print(f"  [ShardWriter]   Tokens per shard     : {self.shard_size:,}")
 
         if total_input_tokens == total_shard_tokens:
             print(f"  [ShardWriter]   ✓ Token count integrity check PASSED.")
         else:
             diff = total_input_tokens - total_shard_tokens
             print(f"  [ShardWriter]   ✗ Token count mismatch: {diff:+,} tokens!")
+
+        # Verify all shards contain complete sequences
+        for path in shard_paths:
+            tokens_in_shard = os.path.getsize(path) // np.dtype(np.uint16).itemsize
+            if tokens_in_shard % self.sequence_length != 0:
+                print(f"  [ShardWriter]   ⚠ Warning: {os.path.basename(path)} "
+                      f"contains partial sequence ({tokens_in_shard} tokens)")
 
         print(f"  [ShardWriter] ────────────────────────────────────────────────────\n")
 
@@ -219,15 +222,6 @@ class ShardWriter:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _flush_shard(
-        self,
-        buffer: np.ndarray,
-        token_count: int,
-        shard_index: int,
-    ) -> str:
-        """Write the filled portion of ``buffer`` to disk and return the path."""
-        return self._write_shard(buffer[:token_count].copy(), shard_index)
-
     def _write_shard(self, tokens: np.ndarray, shard_index: int) -> str:
         """Persist a uint16 token array to a raw .bin file and return the path."""
         filename = f"{self.split}_{shard_index:06d}.bin"
