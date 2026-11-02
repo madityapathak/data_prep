@@ -80,6 +80,22 @@ class ConversationDataLoader:
         split: str = 'train',
         data_root: str = 'shards'
     ):
+        
+        if batch_size <= 0:
+            raise ValueError(f"batch_size cannot be 0 (must be 1 or greater, got {batch_size})")
+
+        if num_processes <= 0:
+            raise ValueError(f"num_processes must be 1 or greater than 1 (got {num_processes})")
+
+        if process_rank < 0:
+            raise ValueError(f"process_rank cannot be negative (got {process_rank})")
+
+        if process_rank >= num_processes:
+            raise ValueError(
+                f"process_rank cannot be greater than or equal to num_processes "
+                f"(got process_rank={process_rank}, num_processes={num_processes})"
+            )
+
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.process_rank = process_rank
