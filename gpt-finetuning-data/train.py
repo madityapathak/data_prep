@@ -41,6 +41,7 @@ if os.environ.get("SINGLE_GPU_DDP_TEST") == "1":
 
 # I/O
 out_dir = 'out'
+log_dir = 'log'
 eval_interval = 2000    # Run train/validation loss evaluation and checkpoint-saving checks every eval_interval (2000) training iterations.
 # log_interval = 1
 eval_iters = 200    # Number of batches evaluated per split (train and val); total samples evaluated = B * eval_iters.
@@ -68,7 +69,9 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 3e-4  # max learning rate (lower than pretraining for fine-tuning)
 max_iters = 100000  # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 1e-2  # Penalizes larger weights more than smaller ones by applying a proportional reduction.
+                      # Weight decay: w_decay = w_old - (weight_decay * w_old)
+                      # Updated weight: w_new = w_old - (learning_rate * gradient) - (weight_decay * w_old)
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
@@ -303,6 +306,10 @@ if wandb_log and master_process:
               if not k.startswith('_') and isinstance(v, (int, float, bool, str))}
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
 
 # =============================================================================
 # Training Loop
@@ -406,10 +413,11 @@ while True:
     t0 = t1
 
     try: 
-        tokens_processed = train_loader.B * train_loader.T * gradient_accumulation_steps * ddp_world_size
+        tokens_processed = batch_size * block_size * gradient_accumulation_steps * ddp_world_size
         step = iter_num
         tokens_per_sec = tokens_processed / dt
         if master_process:
+            print("batch_size * block_size * gradient_accumulation_steps * ddp_world_size",batch_size, block_size, gradient_accumulation_steps, ddp_world_size)
             print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")

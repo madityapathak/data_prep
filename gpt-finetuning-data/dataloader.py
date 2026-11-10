@@ -251,7 +251,6 @@ class ConversationDataLoader:
         B, T = self.batch_size, self.sequence_length
 
         if self.current_step >= self.steps_in_shard:
-            print("shard no : ",self.current_shard_idx)
             self._advance_to_next_shard()
 
         # Calculate token position for this rank's batch
