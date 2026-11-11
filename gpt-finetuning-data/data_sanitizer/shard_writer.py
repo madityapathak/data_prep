@@ -66,7 +66,7 @@ from data_sanitizer.utils import enc, special_tokens
 DEFAULT_SEQUENCE_LENGTH: int = 1024
 
 # Default sequences per shard (16 sequences × 1024 tokens = 16,384 tokens = 32 KB)
-DEFAULT_SEQUENCES_PER_SHARD: int = 16
+DEFAULT_SEQUENCES_PER_SHARD: int = 8192
 
 # GPT-2 base vocab has 50 257 tokens; our custom encoder adds 6 specials
 # → maximum token ID = 50 262, well within uint16 range (65 535).

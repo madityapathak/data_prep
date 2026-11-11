@@ -1,19 +1,11 @@
 TARGETS = {
-    "ultrachat":   99_932,
-    # "openorca":    99_932,
-    "oasst":       99_932,
-    "dailydialog": 99_932,
-    "dolly":       99_932,
-    "static":       2_048,  # Static human conversations
+    "ultrachat":   280_000_000,
+    "openorca":    280_000_000,
+    "oasst":        40_000_000,
+    "dailydialog":  15_000_000,
+    "dolly":        10_000_000,
+    "static":       10_000_000,
 }
-
-
-    # "ultrachat":   70_000_000,
-    # "openorca":    65_000_000,
-    # "oasst":       40_000_000,
-    # "dailydialog": 15_000_000,
-    # "dolly":       10_000_000,
-    # "static":       5_000_000, 
 
 SEED = 65
 
