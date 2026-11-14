@@ -34,6 +34,14 @@ from data_sanitizer.utils import enc, special_tokens
 if os.environ.get("SINGLE_GPU_DDP_TEST") == "1":
     os.environ["NCCL_MULTI_RANK_GPU_ENABLE"] = "1"
 
+# FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated.
+# Please use `torch.amp.GradScaler('cuda', args...)` instead.
+
+
+# batch_size = 5  # Per-GPU batch size: 480 (global batch) / (12 gradient_accumulation_steps * 8 GPUs)
+# max_iters = 673  # (323,956 training sequences // 480 global batch size) - 1
+# warmup_iters = 34  # int((max_iters + 1) * 0.05)  # 5% of total training iterations
+# lr_decay_iters = max_iters  # Cosine learning-rate decay completes at the final training iteration 
 
 # =============================================================================
 # Hyperparameters & Configuration
@@ -55,8 +63,8 @@ wandb_project = 'gpt2-finetuning'
 wandb_run_name = 'gpt2-770m-chat'
 
 # data
-gradient_accumulation_steps = 5 * 8  # simulate larger batch size
-batch_size = 12  # micro-batch size per GPU
+total_batch_size =  131072
+batch_size = 8  # micro-batch size per GPU
 block_size = 1024  # context length
 
 # model - GPT-2 770M configuration (24 layers, 16 heads, 1280 embedding dim)
@@ -68,7 +76,7 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 3e-4  # max learning rate (lower than pretraining for fine-tuning)
-max_iters = 100000  # total number of training iterations
+max_iters = 2535  # total number of training iterations (total tokens in dataset // total_batch_size)
 weight_decay = 1e-2  # Penalizes larger weights more than smaller ones by applying a proportional reduction.
                       # Weight decay: w_decay = w_old - (weight_decay * w_old)
                       # Updated weight: w_new = w_old - (learning_rate * gradient) - (weight_decay * w_old)
@@ -78,8 +86,8 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings (cosine decay with warmup)
 decay_lr = True  # whether to decay the learning rate
-warmup_iters = 2000  # how many steps to warm up for
-lr_decay_iters = 100000  # should be ~= max_iters per Chinchilla
+warmup_iters = 100  # how many steps to warm up for (4% of max_iters)
+lr_decay_iters = 2540  # should be ~= max_iters 
 min_lr = 3e-5  # minimum learning rate, should be ~= learning_rate/10
 
 # system
@@ -108,9 +116,9 @@ if ddp:
     master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank  # each process gets a different seed
     
-    # Scale down gradient accumulation steps per process
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+
+    assert total_batch_size % (batch_size * block_size * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+    gradient_accumulation_steps = total_batch_size // (batch_size * block_size * ddp_world_size)
 else:
     # Single GPU training
     master_process = True
@@ -121,6 +129,7 @@ else:
 
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 if master_process:
+    print("gradient accumulation steps : ", gradient_accumulation_steps)
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
     print(f"Training GPT-2 770M ({n_layer}L, {n_head}H, {n_embd}D)")
 
@@ -215,6 +224,30 @@ if init_from == 'scratch':
         print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+
+elif init_from == 'resume':
+    print(f"Resuming training from {out_dir}")
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
     
 elif init_from.startswith('gpt2'):
     if master_process:
@@ -235,7 +268,8 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # Initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
 # Optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
