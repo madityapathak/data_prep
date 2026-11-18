@@ -218,62 +218,111 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
+
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
+
+        override_args = override_args or {}
+
+        # Only dropout can be overridden
         assert all(k == 'dropout' for k in override_args)
+
         from transformers import GPT2LMHeadModel
+
         print("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
+
+        # Original GPT-2 vocabulary + custom tokens, padded to multiple of 64
+        pretrained_vocab_size = 50257
+        config_args['vocab_size'] = 50304
+        config_args['block_size'] = 1024
+        config_args['bias'] = True
+
+        print(
+            f"forcing vocab_size={config_args['vocab_size']}, "
+            "block_size=1024, bias=True"
+        )
+
+        # Override dropout if requested
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
+
+        # Initialize the model with the expanded vocabulary
         config = GPTConfig(**config_args)
         model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
+        sd = model.state_dict()
+        sd_keys = [k for k in sd.keys() if not k.endswith('.attn.bias')]
+
+        # Load pretrained Hugging Face GPT-2
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
+        sd_keys_hf = [k for k in sd_hf.keys() if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight',]
+
+        # Verify parameter names and counts
+        assert len(sd_keys_hf) == len(sd_keys), (
+            f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        )
+
+        # Copy pretrained weights
         for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
+
+            if k in ('transformer.wte.weight', 'lm_head.weight'):
+
+                # Copy original GPT-2 vocabulary weights.
+                # Additional vocabulary rows retain their initialization.
+                assert sd_hf[k].shape[0] == pretrained_vocab_size
+                assert sd[k].shape[0] == config_args['vocab_size']
+
+                with torch.no_grad():
+                    sd[k][:pretrained_vocab_size].copy_(sd_hf[k])
+
+            elif any(k.endswith(w) for w in transposed):
+
+                # Transpose Hugging Face Conv1D weights
                 assert sd_hf[k].shape[::-1] == sd[k].shape
+
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
+
             else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
+
+                # Copy all remaining parameters normally
+                assert sd_hf[k].shape == sd[k].shape, (
+                    f"Shape mismatch for {k}: "
+                    f"{sd_hf[k].shape} != {sd[k].shape}"
+                )
+
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
+        # Verify expanded vocabulary and tied embeddings
+        assert model.transformer.wte.weight.shape[0] == 50304
+        assert model.lm_head.weight.shape[0] == 50304
+
+        assert (
+            model.transformer.wte.weight.data_ptr()
+            == model.lm_head.weight.data_ptr()
+        ), "Token embeddings and lm_head are not tied!"
+
+        print("Successfully loaded pretrained GPT-2 weights.")
+        print("Expanded vocabulary:", config_args['vocab_size'])
+        print("Original pretrained vocabulary:", pretrained_vocab_size)
+
         return model
+
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -331,6 +380,7 @@ class GPT(nn.Module):
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            logits[:, 50263:] = float('-inf')
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
