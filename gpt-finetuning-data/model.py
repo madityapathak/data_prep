@@ -288,6 +288,12 @@ class GPT(nn.Module):
 
                 with torch.no_grad():
                     sd[k][:pretrained_vocab_size].copy_(sd_hf[k])
+                    # Initialize newly added tokens with the mean of pretrained embeddings.
+                    # This aligns their geometric bias with the pretrained logits distribution
+                    # and prevents an initial loss explosion (e.g. loss starting at ~108).
+                    mean_embedding = sd_hf[k].mean(dim=0, keepdim=True)
+                    noise = torch.randn(sd[k][pretrained_vocab_size:].shape, device=sd[k].device, dtype=sd[k].dtype) * 0.01
+                    sd[k][pretrained_vocab_size:].copy_(mean_embedding + noise)
 
             elif any(k.endswith(w) for w in transposed):
 
