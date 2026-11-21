@@ -49,6 +49,7 @@ if os.environ.get("SINGLE_GPU_DDP_TEST") == "1":
 
 # I/O
 out_dir = 'out'
+best_chkpt = 'best_chkpt'
 log_dir = 'log'
 eval_interval = 2000    # Run train/validation loss evaluation and checkpoint-saving checks every eval_interval (2000) training iterations.
 # log_interval = 1
@@ -140,6 +141,7 @@ if master_process:
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(best_chkpt, exist_ok=True)
 
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
@@ -381,8 +383,31 @@ while True:
                 "mfu": running_mfu * 100,  # convert to percentage
             })
         
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+        if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
+            if iter_num > 0:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': {
+                        'learning_rate': learning_rate,
+                        'max_iters': max_iters,
+                        'batch_size': batch_size,
+                        'block_size': block_size,
+                        'n_layer': n_layer,
+                        'n_head': n_head,
+                        'n_embd': n_embd,
+                    },
+                }
+                if master_process:
+                    print(f"saving best loss checkpoint to {best_chkpt}")
+                torch.save(checkpoint, os.path.join(best_chkpt, 'ckpt.pt'))
+
+
+        if always_save_checkpoint:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
