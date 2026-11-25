@@ -51,9 +51,9 @@ if os.environ.get("SINGLE_GPU_DDP_TEST") == "1":
 out_dir = 'out'
 best_chkpt = 'best_chkpt'
 log_dir = 'log'
-eval_interval = 2000    # Run train/validation loss evaluation and checkpoint-saving checks every eval_interval (2000) training iterations.
+eval_interval = 102    # Run train/validation loss evaluation and checkpoint-saving checks every eval_interval (2000) training iterations.
 # log_interval = 1
-eval_iters = 200    # Number of batches evaluated per split (train and val); total samples evaluated = B * eval_iters.
+eval_iters = 8    # Number of batches evaluated per split (train and val); total samples evaluated = B * eval_iters.
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = 'scratch' if os.environ.get("SINGLE_GPU_DDP_TEST") == "1" else "gpt2-large"  # 'scratch' or 'resume' or 'gpt2*'
@@ -65,7 +65,7 @@ wandb_run_name = 'gpt2-770m-chat'
 
 # data
 total_batch_size =  131072
-batch_size = 8  # micro-batch size per GPU
+batch_size = 32  # micro-batch size per GPU
 block_size = 1024  # context length
 
 # model - GPT-2 770M configuration (24 layers, 16 heads, 1280 embedding dim)
@@ -77,7 +77,7 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 3e-4  # max learning rate (lower than pretraining for fine-tuning)
-max_iters = 2535  # total number of training iterations (total tokens in dataset // total_batch_size)
+max_iters = 2550  # total number of training iterations (total tokens in dataset // total_batch_size)
 weight_decay = 1e-2  # Penalizes larger weights more than smaller ones by applying a proportional reduction.
                       # Weight decay: w_decay = w_old - (weight_decay * w_old)
                       # Updated weight: w_new = w_old - (learning_rate * gradient) - (weight_decay * w_old)
@@ -88,7 +88,7 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings (cosine decay with warmup)
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 100  # how many steps to warm up for (4% of max_iters)
-lr_decay_iters = 2540  # should be ~= max_iters 
+lr_decay_iters = 2550  # should be ~= max_iters 
 min_lr = 3e-5  # minimum learning rate, should be ~= learning_rate/10
 
 # system
@@ -132,8 +132,9 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 if master_process:
     print("gradient accumulation steps : ", gradient_accumulation_steps)
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
-    print(f"Training GPT-2 770M ({n_layer}L, {n_head}H, {n_embd}D)")
 
+if ddp:
+    print("DDP RANK -----===== this must be int from 0 to number of gpus : ",ddp_rank)
 
 # =============================================================================
 # Setup
@@ -175,12 +176,25 @@ val_loader = ConversationDataLoader(
     split='val',
 )
 
+# Use a separate loader for estimating training loss.
+# Reusing the training loader would advance its cursor during loss estimation.
+# This would cause those samples to be skipped during actual training,
+# meaning no gradients would be calculated or applied for those samples.
+eval_train_loader = ConversationDataLoader(
+    batch_size=batch_size,
+    sequence_length=block_size,
+    process_rank=ddp_rank,
+    num_processes=ddp_world_size,
+    split='train',
+)
 
 def get_batch(split):
     if split == 'train':
         x, y = train_loader.next_batch()
     elif split == 'val':
         x, y = val_loader.next_batch()
+    elif split == 'eval_train':
+        x, y = eval_train_loader.next_batch()
     else:
         raise ValueError(f"Invalid split: {split}")
 
@@ -266,6 +280,7 @@ elif init_from.startswith('gpt2'):
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size  # so that the checkpoint will have the right value
+    print("model cropped till block size ---------+++++++++++= this print should not be seen : ", block_size)
 
 model.to(device)
 
@@ -301,7 +316,7 @@ def estimate_loss():
     """
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ['eval_train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -372,12 +387,12 @@ while True:
     # Evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['eval_train']:.4f}, val loss {losses['val']:.4f}")
         
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
+                "train/loss": losses['eval_train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu * 100,  # convert to percentage
@@ -471,11 +486,15 @@ while True:
     dt = t1 - t0
     t0 = t1
 
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+
     try: 
-        tokens_processed = batch_size * block_size * gradient_accumulation_steps * ddp_world_size
-        step = iter_num
-        tokens_per_sec = tokens_processed / dt
-        if master_process:
+        if master_process and iter_num % 20 == 0:
+            tokens_processed = batch_size * block_size * gradient_accumulation_steps * ddp_world_size
+            step = iter_num
+            tokens_per_sec = tokens_processed / dt
+
             print("batch_size * block_size * gradient_accumulation_steps * ddp_world_size",batch_size, block_size, gradient_accumulation_steps, ddp_world_size)
             print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
